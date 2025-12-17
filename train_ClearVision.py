@@ -40,6 +40,14 @@ def main():
     os.makedirs(opt.checkpoint_dir, exist_ok=True)
     os.makedirs(opt.sample_dir, exist_ok=True)
 
+    # AUTO-SAVE CONFIGURATION
+    import json
+    config_path = os.path.join(opt.checkpoint_dir, 'config.json')
+    with open(config_path, 'w') as f:
+        # We use vars(opt) because your variable is named 'opt'
+        json.dump(vars(opt), f, indent=4)
+    print(f"Configuration saved to: {config_path}")
+
     # --- DEVICE SETUP ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Starting ClearVision Training on: {device}")
