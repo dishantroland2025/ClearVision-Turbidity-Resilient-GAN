@@ -142,4 +142,8 @@ def generator_loss(
         "Depth": loss_depth.item() if depth is not None else 0
     }
 
+<<<<<<< HEAD
     return total, loss_dict
+=======
+    return total, loss_dict
+>>>>>>> 4d7af979f4edba360dd059f1075e2200fa5a2d81
