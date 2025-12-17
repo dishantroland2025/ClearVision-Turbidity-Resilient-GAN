@@ -14,7 +14,7 @@ ssl._create_default_https_context = ssl._create_unverified_context
 # Ensure your folder structure matches these imports!
 from models.ClearVision import ClearVisionGenerator, Discriminator
 from utils.dataset import TurbidDataset
-from utils.Loss_Funtion import generator_loss, PerceptualLoss
+from utils.losses import generator_loss, PerceptualLoss
 
 # --- CONFIGURATION ---
 def get_args():
