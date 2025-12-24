@@ -1,0 +1,25 @@
+# Python junk
+__pycache__/
+*.pyc
+
+# Datasets (Too big for GitHub)
+data/
+UIEB_dataset/
+EUVP_dataset/
+
+# Model Checkpoints (Too big)
+checkpoints/
+*.pth
+*.pt
+*.safetensors
+
+# Tuning Database (Don't upload this!)
+optuna_clearvision.db
+*.db
+
+# Generated Results
+samples/
+results/
+
+# OS junk
+.DS_Store
