@@ -39,9 +39,9 @@ def objective(trial):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # PATHS (Verify these!)
-    TURBID_PATH = "/Users/dishantdas/River-UIEB/train/raw"
-    CLEAR_PATH = "/Users/dishantdas/River-UIEB/train/GT"
-    DEPTH_PATH = "/Users/dishantdas/River-UIEB/train/depths"
+    TURBID_PATH = "/Users/dishantdas/Sorted-UIEBraw"
+    CLEAR_PATH = "/Users/dishantdas/Sorted-UIEB/GT"
+    DEPTH_PATH = "/Users/dishantdas/Sorted-UIEB/depths"
     
     try:
         # Init Models
