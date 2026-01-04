@@ -8,3 +8,4 @@ pandas
 kornia
 lpips
 opencv-python-headless
+optuna-dashboard

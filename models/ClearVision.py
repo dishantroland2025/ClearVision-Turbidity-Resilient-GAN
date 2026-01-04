@@ -1,238 +1,332 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from models.ghost_module import GhostModule
-from models.triplet_attention import TripletAttention
-from models.mscc import MultiScaleColorCorrection
+import math
 
-# -----------------------------------------------------------------------------
-# Ghost Residual Block
-# -----------------------------------------------------------------------------
-class GhostResBlock(nn.Module):
+# ==========================================
+# 1. HELPER BLOCKS
+# ==========================================
+
+class StandardResBlock(nn.Module):
     """
-    Ghost Residual Block with Triplet Attention.
-    
-    Structure:
-    - Two Ghost convolution layers
-    - Residual shortcut connection
-    - Triplet Attention after second convolution
-    - BatchNorm and ReLU activations
+    Standard ResNet block. 
+    Structure: Conv3x3 -> BN -> ReLU -> Conv3x3 -> BN -> Add Residual -> ReLU
+    Bias is False because BN follows convolution.
     """
-    def __init__(self, in_channels, out_channels, stride=1, use_triplet=True):
-        super(GhostResBlock, self).__init__()
-        
-        # First Ghost convolution
-        self.conv1 = GhostModule(in_channels, out_channels, stride=stride)
-        self.bn1 = nn.BatchNorm2d(out_channels)
+    def __init__(self, channels):
+        super(StandardResBlock, self).__init__()
+        self.conv1 = nn.Conv2d(channels, channels, 3, 1, 1, bias=False)
+        self.bn1 = nn.BatchNorm2d(channels)
         self.relu = nn.ReLU(inplace=True)
-        
-        # Second Ghost convolution
-        self.conv2 = GhostModule(out_channels, out_channels, stride=1)
-        self.bn2 = nn.BatchNorm2d(out_channels)
-        
-        # Triplet Attention
-        self.use_triplet = use_triplet
-        if use_triplet:
-            self.triplet = TripletAttention()
-        
-        # Shortcut connection
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(out_channels)
-            )
+        self.conv2 = nn.Conv2d(channels, channels, 3, 1, 1, bias=False)
+        self.bn2 = nn.BatchNorm2d(channels)
 
     def forward(self, x):
-        residual = self.shortcut(x)
-        
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-        
-        out = self.conv2(out)
-        out = self.bn2(out)
-        
-        if self.use_triplet:
-            out = self.triplet(out)
-        
+        residual = x
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
         out += residual
         out = self.relu(out)
         return out
 
-# -----------------------------------------------------------------------------
-# ClearVision Generator (FIXED - Correct Skip Connections)
-# -----------------------------------------------------------------------------
-class ClearVisionGenerator(nn.Module):
+class SEBlock(nn.Module):
     """
-    ClearVision Generator: U-Net architecture with Ghost modules,
-    Triplet Attention, and Multi-Scale Color Correction.
-    
-    Architecture follows the research proposal exactly:
-    - 4 Encoder blocks: 64 → 128 → 256 → 512 (scaled by ngf/64)
-    - Bottleneck: MSCC + 4 Ghost Residual Blocks
-    - 4 Decoder blocks with skip connections
-    
-    Performance vs Quality Trade-off (ngf parameter):
-    - ngf=64:  ~15M params, Fast (~100 FPS on Jetson NX), Good quality
-    - ngf=80:  ~26M params, Real-time (~80 FPS), High quality ← RECOMMENDED
-    - ngf=96:  ~37M params, Slower (~50 FPS), Best quality
-    - ngf=112: ~52M params, Too slow for real-time
-    
-    Args:
-        input_nc: Number of input channels (default: 3 for RGB)
-        output_nc: Number of output channels (default: 3 for RGB)
-        ngf: Base number of filters (default: 80 for ~26M params, optimal for Jetson NX)
-             Use ngf=64 for standard, ngf=80 for high capacity, ngf=96 for very high
+    Squeeze-and-Excitation block.
+    Used in skip connections to gate high-frequency noise before it hits the decoder.
+    Reduction ratio 16 is standard.
     """
-    def __init__(self, input_nc=3, output_nc=3, ngf=80):
-        super(ClearVisionGenerator, self).__init__()
-
-        # Calculate channel dimensions based on ngf
-        mult = ngf / 64.0  # Scaling factor
-        
-        c1 = int(64 * mult)   # First encoder output
-        c2 = int(128 * mult)  # Second encoder output
-        c3 = int(256 * mult)  # Third encoder output
-        c4 = int(512 * mult)  # Fourth encoder output (bottleneck)
-
-        # --- Initial Processing ---
-        # Input: 256×256×3 -> 256×256×c1
-        self.initial = nn.Sequential(
-            nn.Conv2d(input_nc, c1, kernel_size=7, stride=1, padding=3, bias=False),
-            nn.BatchNorm2d(c1),
-            nn.ReLU(inplace=True)
+    def __init__(self, channels, reduction=16):
+        super(SEBlock, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
         )
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        # Global Average Pooling -> MLP -> Scale Weights
+        y = self.fc(self.avg_pool(x).view(b, c)).view(b, c, 1, 1)
+        return x * y
 
-        # --- Encoder Path (4 Blocks) ---
-        # Resolution: 256×256 → 256×256 → 128×128 → 64×64 → 32×32
-        self.enc1 = GhostResBlock(c1, c1, stride=1)      # 256×256, c1
-        self.enc2 = GhostResBlock(c1, c2, stride=2)      # 128×128, c2
-        self.enc3 = GhostResBlock(c2, c3, stride=2)      # 64×64, c3
-        self.enc4 = GhostResBlock(c3, c4, stride=2)      # 32×32, c4
-
-        # --- Bottleneck Section ---
-        # 1. Multi-Scale Color Correction Module
-        self.mscc = MultiScaleColorCorrection(channels=c4)
+class ECABlock(nn.Module):
+    """
+    Efficient Channel Attention (ECA-Net).
+    Replaces fully connected layers with 1D convolution for speed (0.0ms latency cost).
+    Kernel size 'k' is calculated dynamically based on channel depth.
+    """
+    def __init__(self, channels, gamma=2, b=1):
+        super(ECABlock, self).__init__()
+        # Calculate adaptive kernel size
+        t = int(abs((math.log(channels, 2) + b) / gamma))
+        k_size = t if t % 2 else t + 1
         
-        # 2. Four Ghost Residual Blocks
-        self.bottleneck_res = nn.Sequential(
-            GhostResBlock(c4, c4),
-            GhostResBlock(c4, c4),
-            GhostResBlock(c4, c4),
-            GhostResBlock(c4, c4)
-        )
-
-        # --- Decoder Path (4 Blocks with CORRECT Skip Connections) ---
-        
-        # Dec 1: bottleneck(c4, 32×32) upsampled to 64×64 + skip e3(c3, 64×64)
-        self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.dec1 = GhostResBlock(c4 + c3, c3)  # Input: c4+c3, Output: c3
-        
-        # Dec 2: dec1(c3, 64×64) upsampled to 128×128 + skip e2(c2, 128×128)
-        self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.dec2 = GhostResBlock(c3 + c2, c2)  # Input: c3+c2, Output: c2
-        
-        # Dec 3: dec2(c2, 128×128) upsampled to 256×256 + skip e1(c1, 256×256)
-        self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.dec3 = GhostResBlock(c2 + c1, c1)  # Input: c2+c1, Output: c1
-        
-        # Dec 4: dec3(c1, 256×256) + skip x0(c1, 256×256) - Final refinement
-        self.dec4 = GhostResBlock(c1 + c1, c1)  # Input: c1+c1, Output: c1
-
-        # --- Output Layer ---
-        self.final = nn.Sequential(
-            nn.Conv2d(c1, output_nc, kernel_size=7, stride=1, padding=3),
-            nn.Tanh()  # Normalize to [-1, 1]
-        )
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        # Input Processing
-        x0 = self.initial(x)  # c1, 256×256
-        
-        # Encoder with skip connections
-        e1 = self.enc1(x0)    # c1, 256×256 (Skip 1)
-        e2 = self.enc2(e1)    # c2, 128×128 (Skip 2)
-        e3 = self.enc3(e2)    # c3, 64×64   (Skip 3)
-        e4 = self.enc4(e3)    # c4, 32×32   (Skip 4)
+        y = self.avg_pool(x)
+        # (B, C, 1, 1) -> (B, 1, C) for Conv1d
+        y = self.conv(y.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
+        y = self.sigmoid(y)
+        return x * y.expand_as(x)
 
-        # Bottleneck
-        b = self.mscc(e4)           # Multi-Scale Color Correction
-        b = self.bottleneck_res(b)  # 4 Residual Blocks (c4, 32×32)
-
-        # Decoder with CORRECTED skip connections
-        # up1: 32×32 → 64×64, concat with e3 (64×64) ✓
-        d1 = self.up1(b)                    # c4, 64×64
-        d1 = torch.cat([d1, e3], dim=1)     # c4+c3, 64×64
-        d1 = self.dec1(d1)                  # c3, 64×64
-
-        # up2: 64×64 → 128×128, concat with e2 (128×128) ✓
-        d2 = self.up2(d1)                   # c3, 128×128
-        d2 = torch.cat([d2, e2], dim=1)     # c3+c2, 128×128
-        d2 = self.dec2(d2)                  # c2, 128×128
-
-        # up3: 128×128 → 256×256, concat with e1 (256×256) ✓
-        d3 = self.up3(d2)                   # c2, 256×256
-        d3 = torch.cat([d3, e1], dim=1)     # c2+c1, 256×256
-        d3 = self.dec3(d3)                  # c1, 256×256
-        
-        # Final refinement: concat with initial features x0 (256×256) ✓
-        d4 = torch.cat([d3, x0], dim=1)     # c1+c1, 256×256
-        d4 = self.dec4(d4)                  # c1, 256×256
-
-        # Output
-        return self.final(d4)
-
-
-# -----------------------------------------------------------------------------
-# Discriminator (PatchGAN)
-# -----------------------------------------------------------------------------
-class Discriminator(nn.Module):
+class CBAM(nn.Module):
     """
-    PatchGAN Discriminator for ClearVision.
-    
-    Evaluates whether patches of the image are real or fake.
-    Conditional discriminator - takes both generated/real image and input image.
-    
-    Args:
-        input_nc: Number of input channels (default: 3)
-        ndf: Base number of discriminator filters (default: 64)
+    Convolutional Block Attention Module.
+    Combines Channel Attention (MLP) and Spatial Attention (7x7 Conv).
+    Used in Enc4 to refine high-level features.
     """
-    def __init__(self, input_nc=3, ndf=64):
-        super(Discriminator, self).__init__()
+    def __init__(self, channels, reduction=16):
+        super(CBAM, self).__init__()
+        # Channel Branch
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
+        )
+        # Spatial Branch (7x7 to capture wider context)
+        self.conv_spatial = nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        # Apply Channel Attn
+        mc = self.fc(self.avg_pool(x).view(b, c)).view(b, c, 1, 1)
+        x = x * mc
+        # Apply Spatial Attn
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        ms = self.sigmoid(self.conv_spatial(torch.cat([avg_out, max_out], dim=1)))
+        return x * ms
+
+class SimplifiedTripletAttention(nn.Module):
+    """
+    Physics-aware attention for underwater depth/color correlation.
+    Rotates the tensor to mix (Channel, Height) and (Channel, Width).
+    Critical for depth-dependent attenuation correction.
+    """
+    def __init__(self):
+        super(SimplifiedTripletAttention, self).__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # 1. Channel-Height Interaction
+        x_perm1 = x.permute(0, 3, 2, 1) # (B, W, H, C)
+        max1, _ = torch.max(x_perm1, dim=1, keepdim=True)
+        avg1 = torch.mean(x_perm1, dim=1, keepdim=True)
+        att1 = self.sigmoid(self.conv(torch.cat([max1, avg1], dim=1)))
+        out1 = (x_perm1 * att1).permute(0, 3, 2, 1)
+
+        # 2. Channel-Width Interaction
+        x_perm2 = x.permute(0, 2, 1, 3) # (B, H, W, C)
+        max2, _ = torch.max(x_perm2, dim=1, keepdim=True)
+        avg2 = torch.mean(x_perm2, dim=1, keepdim=True)
+        att2 = self.sigmoid(self.conv(torch.cat([max2, avg2], dim=1)))
+        out2 = (x_perm2 * att2).permute(0, 2, 1, 3)
+
+        return (out1 + out2) / 2.0
+
+class MultiScaleColorCorrection(nn.Module):
+    """
+    Dual-branch color corrector placed after the bottleneck.
+    Global Branch: 1024-dim MLP acts as a 'lookup table' for water types.
+    Local Branch: Spatial convolution for depth-dependent adjustment.
+    """
+    def __init__(self, channels):
+        super(MultiScaleColorCorrection, self).__init__()
+        # Expanded capacity (1024) + Dropout to prevent overfitting on small datasets
+        self.global_branch = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1), nn.Flatten(),
+            nn.Linear(channels, 1024), nn.ReLU(True),
+            nn.Dropout(0.3),
+            nn.Linear(1024, channels), nn.Sigmoid()
+        )
+        self.local_branch = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1), nn.Sigmoid()
+        )
+    def forward(self, x):
+        b, c, h, w = x.size()
+        g = self.global_branch(x).view(b, c, 1, 1)
+        l = self.local_branch(x)
+        # Multiplicative correction (Physics: attenuation is multiplicative)
+        return x * ((g + l) / 2.0)
+
+# ==========================================
+# 2. MAIN GENERATOR (Phase 2 Fixed Architecture)
+# ==========================================
+
+class ClearVisionGenerator(nn.Module):
+    def __init__(self, input_nc=3, output_nc=3, ngf=32):
+        super(ClearVisionGenerator, self).__init__()
+
+        # --- ENCODER ---
+        # Level 0: Input 256x256 -> 32ch. 7x7 conv for large initial receptive field.
+        self.initial_conv = nn.Sequential(
+            nn.Conv2d(input_nc, ngf, 7, 1, 3, bias=False), 
+            nn.BatchNorm2d(ngf),
+            nn.ReLU(True)
+        )
+
+        # Level 1: 32 -> 64 channels (Downsample 256 -> 128)
+        self.enc1 = StandardResBlock(ngf)
+        self.down1 = nn.Conv2d(ngf, ngf*2, 3, 2, 1, bias=False)
+
+        # Level 2: 64 -> 128 channels (Downsample 128 -> 64)
+        self.enc2 = StandardResBlock(ngf*2)
+        self.down2 = nn.Conv2d(ngf*2, ngf*4, 3, 2, 1, bias=False)
+
+        # Level 3: 128 -> 256 channels (Intermediate Stage)
+        # Phase 2 Fix: Added this stage to bridge the gap between 128 and 384 channels.
+        # Keeps resolution at 64x64.
+        self.enc3 = StandardResBlock(ngf*4)
+        self.expand4 = nn.Conv2d(ngf*4, ngf*8, 1, 1, 0, bias=False) # 1x1 Expansion
+        self.enc4 = nn.Sequential(StandardResBlock(ngf*8), CBAM(ngf*8)) # CBAM here on deep features
         
-        # Input: Real/Fake (3) + Condition (3) = 6 channels
+        # Level 4: 256 -> 384 channels (Downsample 64 -> 32)
+        # This feeds the heavy bottleneck.
+        self.down4 = nn.Conv2d(ngf*8, 384, 3, 2, 1, bias=False)
+
+        # --- BOTTLENECK (High Capacity) ---
+        # Resolution: 32x32. Channels: 384.
+        # Split into Pre/Post with Triplet Attention in the middle.
+        self.bottleneck_pre = nn.Sequential(
+            StandardResBlock(384), StandardResBlock(384), StandardResBlock(384)
+        )
+        self.triplet = SimplifiedTripletAttention()
+        self.bn_triplet = nn.BatchNorm2d(384) # Added BN to stabilize attention gradients
+        self.bottleneck_post = nn.Sequential(
+            StandardResBlock(384), StandardResBlock(384), StandardResBlock(384), StandardResBlock(384)
+        )
+        self.mscc = MultiScaleColorCorrection(channels=384)
+
+        # --- DECODER ---
+        # Standard U-Net decoder with ECA blocks added for channel calibration.
+        # Note: Decoder shapes must match Encoder outputs (r4, r3, r2, r1).
+
+        # Dec 1: Upsample 32 -> 64. Channels 384 -> 256.
+        # Concats with r4 (256ch).
+        self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.bn_up1 = nn.BatchNorm2d(384) # Norm before concat is crucial
+        self.skip_att1 = SEBlock(ngf*8)   # SE Gate
+        self.reduce1 = nn.Conv2d(384 + ngf*8, ngf*8, 1, 1, 0, bias=False)
+        self.dec1 = nn.Sequential(StandardResBlock(ngf*8), ECABlock(ngf*8))
+
+        # Dec 2: Upsample 64 -> 128. Channels 256 -> 128.
+        # Concats with r2 (Note: r2 is 64ch, r3 was processed in intermediate stage).
+        self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.skip_att2 = SEBlock(ngf*2)
+        # 256 (from up) + 64 (from skip) -> Reduce to 64
+        self.reduce2 = nn.Conv2d(ngf*8 + ngf*2, ngf*2, 1, 1, 0, bias=False)
+        self.dec2 = nn.Sequential(StandardResBlock(ngf*2), ECABlock(ngf*2))
+
+        # Dec 3: Upsample 128 -> 256. Channels 64 -> 32.
+        # Concats with r1 (32ch).
+        self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.skip_att3 = SEBlock(ngf)
+        self.reduce3 = nn.Conv2d(ngf*2 + ngf, ngf, 1, 1, 0, bias=False)
+        self.dec3 = nn.Sequential(StandardResBlock(ngf), ECABlock(ngf))
+
+        self.final = nn.Sequential(nn.Conv2d(ngf, output_nc, 3, 1, 1), nn.Tanh())
+
+    def forward(self, x):
+        # --- ENCODER PASS ---
+        x0 = self.initial_conv(x)       # [B, 32, 256, 256]
+        r1 = self.enc1(x0)
+        
+        x1 = self.down1(r1)             # [B, 64, 128, 128]
+        r2 = self.enc2(x1)
+        
+        x2 = self.down2(r2)             # [B, 128, 64, 64]
+        r3 = self.enc3(x2)
+        
+        # Intermediate Stage (Phase 2)
+        x3_exp = self.expand4(r3)       # [B, 256, 64, 64]
+        r4 = self.enc4(x3_exp)          # Clean features for skip connection
+        
+        x4 = self.down4(r4)             # [B, 384, 32, 32] - To Bottleneck
+
+        # --- BOTTLENECK PASS ---
+        b = self.bottleneck_pre(x4)
+        b = self.triplet(b)
+        b = self.bn_triplet(b)
+        b = self.bottleneck_post(b)
+        b = self.mscc(b)                # Color correction applied here
+
+        # --- DECODER PASS ---
+        # D1: Recover to 64x64
+        u1 = self.bn_up1(self.up1(b))
+        s1 = self.skip_att1(r4)         # Gate high-level features
+        d1 = self.dec1(self.reduce1(torch.cat([u1, s1], dim=1)))
+
+        # D2: Recover to 128x128
+        # We skip r3 (intermediate) and jump to r2 for spatial alignment
+        u2 = self.up2(d1)
+        s2 = self.skip_att2(r2)
+        d2 = self.dec2(self.reduce2(torch.cat([u2, s2], dim=1)))
+
+        # D3: Recover to 256x256
+        u3 = self.up3(d2)
+        s3 = self.skip_att3(r1)
+        d3 = self.dec3(self.reduce3(torch.cat([u3, s3], dim=1)))
+
+        return self.final(d3)
+    
+
+# ==========================================
+# 3. DISCRIMINATOR
+# ==========================================
+
+class PatchGANDiscriminator(nn.Module):
+    """
+    River-Optimized 70x70 PatchGAN Discriminator.
+    
+    Configuration:
+    - Normalization: BATCH NORM (Specific for Single-Domain River Data).
+      Captures the global distribution of river sediment/turbidity.
+    - Stabilization: SPECTRAL NORM (Critical for 25M+ Generator).
+      Prevents gradient explosion during training.
+    - Capacity: High (ndf=128 -> ~11M Params).
+    """
+    def __init__(self, input_nc=3, ndf=128):
+        super(PatchGANDiscriminator, self).__init__()
+        
+        # Helper to create a Spectrally Normalized block with Batch Norm
+        def discriminator_block(in_filters, out_filters, normalization=True):
+            layers = [nn.utils.spectral_norm(nn.Conv2d(in_filters, out_filters, 4, stride=2, padding=1, bias=False))]
+            if normalization:
+                # Batch Norm is superior for single-domain (River) datasets 
+                # because it learns the domain-specific statistics (brown cast, sediment density).
+                layers.append(nn.BatchNorm2d(out_filters)) 
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            return layers
+
         self.model = nn.Sequential(
-            # Layer 1: 6 → 64
-            nn.Conv2d(input_nc * 2, ndf, 4, 2, 1),
-            nn.LeakyReLU(0.2, inplace=True),
+            # Input: Real/Fake (3) + Turbid (3) = 6 channels
+            # Layer 1: 6 -> 128 (No Norm in first layer)
+            *discriminator_block(input_nc * 2, ndf, normalization=False),
             
-            # Layer 2: 64 → 128
-            nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(ndf * 2),
-            nn.LeakyReLU(0.2, inplace=True),
+            # Layer 2: 128 -> 256
+            *discriminator_block(ndf, ndf * 2),
             
-            # Layer 3: 128 → 256
-            nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(ndf * 4),
-            nn.LeakyReLU(0.2, inplace=True),
+            # Layer 3: 256 -> 512
+            *discriminator_block(ndf * 2, ndf * 4),
             
-            # Layer 4: 256 → 512
-            nn.Conv2d(ndf * 4, ndf * 8, 4, 1, 1, bias=False),
+            # Layer 4: 512 -> 1024 (Stride 1)
+            nn.utils.spectral_norm(nn.Conv2d(ndf * 4, ndf * 8, 4, stride=1, padding=1, bias=False)),
             nn.BatchNorm2d(ndf * 8),
             nn.LeakyReLU(0.2, inplace=True),
             
-            # Output: 512 → 1
-            nn.Conv2d(ndf * 8, 1, 4, 1, 1)
+            # Output: 1024 -> 1 (Patch Map)
+            nn.Conv2d(ndf * 8, 1, 4, stride=1, padding=1)
         )
 
     def forward(self, x, condition):
-        """
-        Args:
-            x: Generated or real image
-            condition: Input degraded image
-        Returns:
-            Patch-wise predictions (real/fake)
-        """
-        x = torch.cat([x, condition], dim=1)
-        return self.model(x)
+        # Concatenate: [Clear/Fake, Turbid]
+        img_input = torch.cat((x, condition), 1)
+        return self.model(img_input)
