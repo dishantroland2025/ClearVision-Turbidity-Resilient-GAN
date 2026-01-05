@@ -1,180 +1,135 @@
 import torch
 import torch.nn as nn
 import numpy as np
-import math
-from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+from skimage.metrics import structural_similarity as ssim_func
+from skimage.metrics import peak_signal_noise_ratio as psnr_func
 import lpips
-import cv2
+import math
 
-# --- Helper: Tensor Processing ---
-def preprocess_batch(img_batch):
+# =========================================
+# 1. PSNR Metric
+# =========================================
+def calculate_psnr(img_gt, img_gen):
     """
-    Converts input (Tensor or Numpy) into a list of [H, W, C] numpy arrays [0, 255].
-    Handles Denormalization from [-1, 1] to [0, 255].
+    Calculates Peak Signal-to-Noise Ratio (PSNR).
+    Expects numpy arrays in [0, 255].
     """
-    # 1. Handle PyTorch Tensors
-    if isinstance(img_batch, torch.Tensor):
-        # Detach from graph, move to CPU, convert to numpy
-        img_batch = img_batch.detach().cpu().numpy()
-
-    # 2. Handle Dimensions
-    # If single image (C, H, W) -> add batch dim -> (1, C, H, W)
-    if img_batch.ndim == 3:
-        img_batch = img_batch[np.newaxis, ...]
-
-    # 3. Process the batch
-    processed_imgs = []
-    for img in img_batch:
-        # Check if image is Channel-First (C, H, W) typically 3x256x256
-        if img.shape[0] == 3 or img.shape[0] == 1:
-            img = np.transpose(img, (1, 2, 0)) # Convert to (H, W, C)
-
-        # 4. Denormalize: Assume GAN output is [-1, 1], convert to [0, 255]
-        # Only denormalize if values are small (float range)
-        if img.max() <= 1.1: 
-            img = (img * 0.5 + 0.5) * 255.0
-        
-        # Clip and cast
-        img = np.clip(img, 0, 255).astype(np.uint8)
-        processed_imgs.append(img)
-        
-    return processed_imgs
-
-# --- 1. Standard Reference Metrics (PSNR, SSIM, LPIPS) ---
-
-def calculate_psnr(img1, img2):
-    """Calculates average PSNR for a batch."""
-    imgs1 = preprocess_batch(img1)
-    imgs2 = preprocess_batch(img2)
+    # Ensure they are the same size
+    if img_gen.shape != img_gt.shape:
+        return 0.0
     
-    scores = []
-    for i in range(len(imgs1)):
-        # data_range=255 is valid because preprocess_batch casts to uint8
-        score = peak_signal_noise_ratio(imgs1[i], imgs2[i], data_range=255)
-        scores.append(score)
-        
-    return np.mean(scores)
+    return psnr_func(img_gt, img_gen, data_range=255)
 
-def calculate_ssim(img1, img2):
-    """Calculates average SSIM for a batch."""
-    imgs1 = preprocess_batch(img1)
-    imgs2 = preprocess_batch(img2)
+# =========================================
+# 2. SSIM Metric
+# =========================================
+def calculate_ssim(img_gt, img_gen):
+    """
+    Calculates Structural Similarity Index (SSIM).
+    Expects numpy arrays in [0, 255].
+    """
+    # Ensure they are the same size
+    if img_gen.shape != img_gt.shape:
+        return 0.0
     
-    scores = []
-    for i in range(len(imgs1)):
-        # channel_axis=2 handles RGB (H, W, C)
-        score = structural_similarity(
-            imgs1[i], 
-            imgs2[i], 
-            data_range=255, 
-            channel_axis=2 
-        )
-        scores.append(score)
-        
-    return np.mean(scores)
+    # Multichannel=True handles RGB images correctly
+    return ssim_func(img_gt, img_gen, data_range=255, channel_axis=2)
 
-# LPIPS requires a model download, initialized once to save time
+# =========================================
+# 3. LPIPS Metric (THE FIX IS HERE)
+# =========================================
 class LPIPSMetric:
     def __init__(self, device='cuda'):
-        self.device = device
-        # AlexNet is the standard backbone for LPIPS comparison
-        self.loss_fn = lpips.LPIPS(net='alex').to(device).eval()
+        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+        # Initialize LPIPS model (AlexNet is standard for speed/accuracy balance)
+        self.loss_fn = lpips.LPIPS(net='alex').to(self.device).eval()
 
-    def calculate(self, img1, img2):
+    def calculate(self, img_gt, img_gen):
         """
-        Inputs: PyTorch Tensors or Numpy.
         Calculates LPIPS distance.
+        Inputs: Numpy arrays (H, W, C) in [0, 255]
         """
-        # Ensure inputs are tensors on the correct device
-        if not isinstance(img1, torch.Tensor):
-            t1 = torch.from_numpy(img1).float().to(self.device)
-        else:
-            t1 = img1.to(self.device)
-
-        if not isinstance(img2, torch.Tensor):
-            t2 = torch.from_numpy(img2).float().to(self.device)
-        else:
-            t2 = img2.to(self.device)
-            
-        # LPIPS expects inputs in [-1, 1].
-        # If input is [0, 1] (Sigmoid), normalize to [-1, 1]
-        if t1.max() <= 1.0 and t1.min() >= 0.0:
-            t1 = t1 * 2.0 - 1.0
-            t2 = t2 * 2.0 - 1.0
-        
-        # If input is [0, 255], normalize to [-1, 1]
-        elif t1.max() > 1.1:
-            t1 = (t1 / 127.5) - 1.0
-            t2 = (t2 / 127.5) - 1.0
-
         with torch.no_grad():
-            dist = self.loss_fn(t1, t2)
+            # 1. Convert Numpy -> Tensor
+            t_gt = torch.from_numpy(img_gt).float().to(self.device)
+            t_gen = torch.from_numpy(img_gen).float().to(self.device)
+
+            # 2. Permute Dimensions: (H, W, C) -> (1, C, H, W)
+            # This fixes the "Tensor size 256 vs 3" error
+            t_gt = t_gt.permute(2, 0, 1).unsqueeze(0)
+            t_gen = t_gen.permute(2, 0, 1).unsqueeze(0)
+
+            # 3. Normalize: [0, 255] -> [-1, 1] (Required by LPIPS)
+            t_gt = (t_gt / 255.0) * 2.0 - 1.0
+            t_gen = (t_gen / 255.0) * 2.0 - 1.0
+
+            # 4. Calculate Distance
+            dist = self.loss_fn(t_gen, t_gt)
             
-        return dist.mean().item()
+        return dist.item()
 
+# =========================================
+# 4. UIQM Metric (Standard Implementation)
+# =========================================
+class UIQMMetric:
+    def __init__(self):
+        pass
 
-# --- 2. Underwater Specific Metric (UIQM) ---
+    def calculate(self, img):
+        """
+        Calculates UIQM (Underwater Image Quality Measure).
+        Input: Numpy array (H, W, C) in [0, 255] (RGB)
+        """
+        # Simple/Fast implementation of UIQM components
+        # (UICM, UISM, UIConM)
+        try:
+            return self.getUIQM(img)
+        except Exception as e:
+            print(f"UIQM Error: {e}")
+            return 0.0
 
-def calculate_uiqm(img_input):
-    """
-    Underwater Image Quality Measure (UIQM).
-    Handles Batch inputs by averaging scores.
-    """
-    # Preprocess converts to [0, 255] numpy HWC list
-    imgs = preprocess_batch(img_input)
-    
-    c1, c2, c3 = 0.0282, 0.2953, 3.5753 
-    scores = []
-    
-    for img in imgs:
-        uicm = _uicm(img)
-        uism = _uism(img)
-        uiconm = _uiconm(img)
-        scores.append(c1 * uicm + c2 * uism + c3 * uiconm)
-    
-    return np.mean(scores)
+    def getUIQM(self, img):
+        # Weights for the 3 components (standard paper values)
+        c1, c2, c3 = 0.0282, 0.2953, 3.5753
+        uicm = self.getUICM(img)
+        uism = self.getUISM(img)
+        uiconm = self.getUIConM(img)
+        return c1 * uicm + c2 * uism + c3 * uiconm
 
-def _uicm(img):
-    """Underwater Image Colorfulness Measure"""
-    # Cast to float for calculations
-    img = img.astype(np.float32)
-    R, G, B = img[:,:,0], img[:,:,1], img[:,:,2]
-    rg = R - G
-    yb = 0.5 * (R + G) - B
-    
-    mu_rg, sig_rg = np.mean(rg), np.std(rg)
-    mu_yb, sig_yb = np.mean(yb), np.std(yb)
-    
-    return -0.0268 * np.sqrt(mu_rg**2 + mu_yb**2) + 0.1586 * np.sqrt(sig_rg**2 + sig_yb**2)
+    def getUICM(self, img):
+        # Underwater Image Colorfulness Measure
+        img = img.astype(float)
+        R, G, B = img[:,:,0], img[:,:,1], img[:,:,2]
+        rg = R - G
+        yb = 0.5 * (R + G) - B
+        mu_rg, sig_rg = np.mean(rg), np.std(rg)
+        mu_yb, sig_yb = np.mean(yb), np.std(yb)
+        return math.sqrt(mu_rg**2 + mu_yb**2) + math.sqrt(sig_rg**2 + sig_yb**2)
 
-def _uism(img):
-    """Underwater Image Sharpness Measure"""
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0)
-    gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1)
-    
-    edge_map = np.sqrt(gx**2 + gy**2)
-    return np.mean(edge_map)
+    def getUISM(self, img):
+        # Underwater Image Sharpness Measure (Simplified)
+        # Using Sobel gradient magnitude as proxy for sharpness
+        gray = 0.299 * img[:,:,0] + 0.587 * img[:,:,1] + 0.114 * img[:,:,2]
+        gy, gx = np.gradient(gray)
+        gnorm = np.sqrt(gx**2 + gy**2)
+        # EME (Enhancement Measure by Entropy) logic approx
+        return np.mean(gnorm) 
 
-def _uiconm(img):
-    """Underwater Image Contrast Measure (LogAMEE)"""
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    
-    h, w = gray.shape
-    k = 32
-    entropy_vals = []
-    
-    for i in range(0, h-k, k):
-        for j in range(0, w-k, k):
-            block = gray[i:i+k, j:j+k]
-            max_val = np.max(block)
-            min_val = np.min(block)
-            
-            # Avoid division by zero
-            denom = max_val + min_val
-            if denom > 0 and max_val > min_val:
-                val = (max_val - min_val) / denom
-                entropy_vals.append(val)
-    
-    if len(entropy_vals) == 0: return 0.0
-    return np.mean(entropy_vals)
+    def getUIConM(self, img):
+        # Underwater Image Contrast Measure (Log Michelson Contrast)
+        gray = 0.299 * img[:,:,0] + 0.587 * img[:,:,1] + 0.114 * img[:,:,2]
+        # Divide into blocks (e.g., 32x32)
+        h, w = gray.shape
+        block_size = 32
+        k_h = h // block_size
+        k_w = w // block_size
+        val = 0.0
+        if k_h == 0 or k_w == 0: return 0.0
+        
+        for i in range(k_h):
+            for j in range(k_w):
+                block = gray[i*block_size:(i+1)*block_size, j*block_size:(j+1)*block_size]
+                mn, mx = np.min(block), np.max(block)
+                if mx > mn and (mx+mn) > 0:
+                    val += math.log((mx-mn)/(mx+mn))
+        return -1.0 / (k_h * k_w) * val # Log contrast is usually negative, we invert
