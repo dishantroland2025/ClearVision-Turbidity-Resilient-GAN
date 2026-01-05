@@ -54,7 +54,14 @@ def get_args():
 def main():
     opt = get_args()
     
-    # 1. Setup
+    # 0. Device Setup & Sanity Check
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        print("⚠️ WARNING: CUDA not available. Training on CPU will be extremely slow.")
+        device = torch.device("cpu")
+
+    # 1. Setup Directories
     chk_dir = os.path.join(opt.checkpoint_dir, opt.name)
     vis_dir = os.path.join(opt.sample_dir, opt.name)
     os.makedirs(chk_dir, exist_ok=True)
@@ -64,8 +71,8 @@ def main():
     with open(os.path.join(chk_dir, 'config.json'), 'w') as f:
         json.dump(vars(opt), f, indent=4)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"--- Experiment: {opt.name} ---")
+    print(f"    Device: {device}")
 
     # 2. Models
     generator = ClearVisionGenerator(ngf=opt.ngf).to(device)
@@ -80,6 +87,7 @@ def main():
     optimizer_G = torch.optim.Adam(generator.parameters(), lr=opt.lr, betas=(0.5, 0.999))
     optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=opt.lr, betas=(0.5, 0.999))
     
+    # Updated GradScaler for compatibility
     scaler = torch.cuda.amp.GradScaler(enabled=opt.use_amp)
     start_epoch = 0
 
@@ -157,9 +165,17 @@ def main():
             optimizer_G.zero_grad()
             with torch.cuda.amp.autocast(enabled=opt.use_amp):
                 fake_clear = generator(turbid)
+                
+                # --- FIXED: Use Keyword Arguments to prevent TypeError ---
                 loss_G, loss_dict = generator_loss(
-                    discriminator, clear, fake_clear, turbid, depth, 
-                    perceptual_fn, ssim_fn, loss_weights
+                    D=discriminator, 
+                    real_img=clear, 
+                    fake_img=fake_clear, 
+                    input_img=turbid, 
+                    depth=depth, 
+                    perceptual_fn=perceptual_fn, 
+                    ssim_fn=ssim_fn, 
+                    lambdas=loss_weights
                 )
 
             scaler.scale(loss_G).backward()
