@@ -136,7 +136,19 @@ def main():
 
     # 6. Loop
     for epoch in range(start_epoch, opt.epochs):
-        loop = tqdm(dataloader, desc=f"Epoch {epoch+1}/{opt.epochs}")
+        # --- PHASED TRAINING LOGIC (NEW) ---
+        # 1. Warmup Phase (Epoch 0-20): Turn off GAN loss
+        if epoch < 20:
+            current_lambda_adv = 0.0
+            phase_status = "WARMUP (No GAN)"
+        # 2. GAN Phase (Epoch 20+): Enable GAN loss
+        else:
+            current_lambda_adv = opt.lambda_adv  # Uses the value 0.5 or 1.0 you set
+            phase_status = "GAN ENABLED"
+            
+        # Update the dictionary passed to the loss function
+        loss_weights['adv'] = current_lambda_adv
+        loop = tqdm(dataloader, desc=f"Epoch {epoch+1}/{opt.epochs} [{phase_status}]")
         
         for i, (turbid, clear, depth) in enumerate(loop):
             turbid, clear, depth = turbid.to(device), clear.to(device), depth.to(device)
