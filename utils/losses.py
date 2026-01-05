@@ -1,28 +1,44 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import kornia.color as K
 import kornia.filters as KF
+import math
 
-
-# -------------------------------------------------
-# Adversarial Loss (LSGAN)
-# -------------------------------------------------
+# ==========================================
+# 1. ADVERSARIAL LOSS (LSGAN)
+# ==========================================
 def adversarial_loss(pred, target_is_real=True):
+    """
+    Least Squares GAN Loss (Mao et al.).
+    More stable than BCE Loss, prevents vanishing gradients.
+    """
     target = torch.ones_like(pred) if target_is_real else torch.zeros_like(pred)
     return torch.mean((pred - target) ** 2)
 
 
-# -------------------------------------------------
-# Pixel Loss (L1)
-# -------------------------------------------------
+# ==========================================
+# 2. PIXEL LOSS (L1)
+# ==========================================
 def pixel_loss(fake, real):
+    """
+    Standard L1 Loss. Enforces pixel-wise accuracy.
+    Good for low-frequency content (colors, general brightness).
+    """
     return torch.mean(torch.abs(fake - real))
 
 
-# -------------------------------------------------
-# LAB Color Loss (a, b channels only)
-# -------------------------------------------------
+# ==========================================
+# 3. LAB COLOR LOSS
+# ==========================================
 def lab_color_loss(fake, real):
+    """
+    Computes L1 loss only on 'a' and 'b' channels of CIELAB space.
+    Crucial for underwater correction:
+    - 'a' channel: Green-Red axis (fixes heavy green cast).
+    - 'b' channel: Blue-Yellow axis (fixes blue haze).
+    """
+    # Convert [-1, 1] RGB -> [0, 1] RGB -> LAB
     fake_lab = K.rgb_to_lab((fake + 1) / 2)
     real_lab = K.rgb_to_lab((real + 1) / 2)
 
@@ -32,30 +48,92 @@ def lab_color_loss(fake, real):
     )
 
 
-# -------------------------------------------------
-# Edge Loss (Sobel)
-# -------------------------------------------------
+# ==========================================
+# 4. EDGE LOSS (Sobel)
+# ==========================================
 def edge_loss(fake, real):
+    """
+    Computes gradients (edges) using Sobel filters.
+    Forces the generator to recover high-frequency details (sand texture, coral edges)
+    which L1 loss tends to blur.
+    """
     fake_edges = KF.sobel(fake)
     real_edges = KF.sobel(real)
     return torch.mean(torch.abs(fake_edges - real_edges))
 
 
-# -------------------------------------------------
-# Depth-Weighted Loss
-# -------------------------------------------------
+# ==========================================
+# 5. DEPTH-WEIGHTED LOSS (Physics-Based)
+# ==========================================
 def depth_weighted_loss(fake, real, depth, max_depth=1.0):
+    """
+    Weights the pixel loss based on water depth.
+    Physics Logic: Attenuation is exponential with depth. Errors in deep regions
+    are physically harder to correct and should be penalized more.
+    """
     if depth.dim() == 3:
-        depth = depth.unsqueeze(1)
+        depth = depth.unsqueeze(1) # Ensure [B, 1, H, W]
 
+    # Weight map: 1.0 (shallow) -> 5.0 (deep)
     weights = 1.0 + 4.0 * (depth / max_depth)
     return torch.mean(weights * torch.abs(fake - real))
 
 
-# -------------------------------------------------
-# Perceptual Loss (VGG-based, WITH normalization)
-# -------------------------------------------------
+# ==========================================
+# 6. MS-SSIM LOSS (Structural Similarity)
+# ==========================================
+class MSSSIMLoss(nn.Module):
+    """
+    Multi-Scale Structural Similarity Loss.
+    Standard metric for Image Enhancement papers.
+    Optimizes for structural fidelity rather than just pixel accuracy.
+    """
+    def __init__(self, window_size=11, channel=3):
+        super(MSSSIMLoss, self).__init__()
+        self.window_size = window_size
+        self.channel = channel
+        
+    def _gaussian(self, window_size, sigma):
+        gauss = torch.Tensor([math.exp(-(x - window_size//2)**2/float(2*sigma**2)) for x in range(window_size)])
+        return gauss/gauss.sum()
+
+    def _create_window(self, window_size, channel):
+        _1D_window = self._gaussian(window_size, 1.5).unsqueeze(1)
+        _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
+        window = _2D_window.expand(channel, 1, window_size, window_size).contiguous()
+        return window
+
+    def _ssim(self, img1, img2, window, window_size, channel):
+        mu1 = F.conv2d(img1, window, padding=window_size//2, groups=channel)
+        mu2 = F.conv2d(img2, window, padding=window_size//2, groups=channel)
+        mu1_sq = mu1.pow(2); mu2_sq = mu2.pow(2); mu1_mu2 = mu1*mu2
+        sigma1_sq = F.conv2d(img1*img1, window, padding=window_size//2, groups=channel) - mu1_sq
+        sigma2_sq = F.conv2d(img2*img2, window, padding=window_size//2, groups=channel) - mu2_sq
+        sigma12 = F.conv2d(img1*img2, window, padding=window_size//2, groups=channel) - mu1_mu2
+        C1 = 0.01**2; C2 = 0.03**2
+        ssim_map = ((2*mu1_mu2 + C1)*(2*sigma12 + C2))/((mu1_sq + mu2_sq + C1)*(sigma1_sq + sigma2_sq + C2))
+        return ssim_map.mean()
+
+    def forward(self, img1, img2):
+        if img1.is_cuda:
+            window = self._create_window(self.window_size, self.channel).cuda(img1.get_device())
+        else:
+            window = self._create_window(self.window_size, self.channel)
+        
+        # Invert SSIM (1 is perfect, so Loss = 1 - SSIM)
+        # Mix with L1 for stability (Zhao et al. MixLoss)
+        return 0.84 * (1 - self._ssim(img1, img2, window, self.window_size, self.channel)) + 0.16 * torch.mean(torch.abs(img1 - img2))
+
+
+# ==========================================
+# 7. PERCEPTUAL LOSS (VGG-19)
+# ==========================================
 class PerceptualLoss(nn.Module):
+    """
+    Computes distance between feature maps of VGG-19.
+    Ensures generated image matches 'semantic content' of ground truth,
+    not just pixel values.
+    """
     def __init__(self, vgg):
         super().__init__()
         self.vgg = vgg
@@ -65,13 +143,9 @@ class PerceptualLoss(nn.Module):
             p.requires_grad = False
 
     def _normalize(self, x):
-        mean = torch.tensor(
-            [0.485, 0.456, 0.406], device=x.device
-        ).view(1, 3, 1, 1)
-        std = torch.tensor(
-            [0.229, 0.224, 0.225], device=x.device
-        ).view(1, 3, 1, 1)
-
+        # ImageNet Normalization
+        mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(1, 3, 1, 1)
         x = (x + 1) / 2  # [-1, 1] → [0, 1]
         return (x - mean) / std
 
@@ -91,9 +165,9 @@ class PerceptualLoss(nn.Module):
         return loss
 
 
-# -------------------------------------------------
-# Generator Loss (Combined)
-# -------------------------------------------------
+# ==========================================
+# 8. GENERATOR LOSS AGGREGATOR
+# ==========================================
 def generator_loss(
     D,
     real_img,
@@ -102,43 +176,50 @@ def generator_loss(
     depth=None,
     max_depth=1.0,
     perceptual_fn=None,
+    ssim_fn=None, # <--- Added support for SSIM
     lambdas=None
 ):
-    # Adversarial
-    pred_fake = D(input_img, fake_img)
+    """
+    Aggregates all 7 loss components into a single scalar.
+    """
+    # 1. Adversarial Loss (Fool the Discriminator)
+    # PatchGAN D input: [Fake, Turbid]
+    pred_fake = D(fake_img, input_img)
     loss_adv = adversarial_loss(pred_fake, True)
 
-    # Core losses
+    # 2. Pixel & Color Losses
     loss_pix = pixel_loss(fake_img, real_img)
     loss_color = lab_color_loss(fake_img, real_img)
     loss_edge = edge_loss(fake_img, real_img)
-    loss_perc = perceptual_fn(fake_img, real_img) if perceptual_fn is not None else 0
+    
+    # 3. Advanced Metrics
+    loss_perc = perceptual_fn(fake_img, real_img) if perceptual_fn else 0
+    loss_ssim = ssim_fn(fake_img, real_img) if ssim_fn else 0
+    
+    # 4. Physics Loss
+    loss_depth = 0
+    if depth is not None:
+        loss_depth = depth_weighted_loss(fake_img, real_img, depth, max_depth)
 
-    # Depth (optional)
-    loss_depth = (
-        depth_weighted_loss(fake_img, real_img, depth, max_depth)
-        if depth is not None else 0
-    )
-
-    # Weighted sum
+    # Weighted Sum
     total = (
         lambdas["adv"] * loss_adv +
         lambdas["pixel"] * loss_pix +
         lambdas["color"] * loss_color +
         lambdas["edge"] * loss_edge +
         lambdas["perc"] * loss_perc +
+        lambdas["ssim"] * loss_ssim +
         lambdas["depth"] * loss_depth
     )
 
-    # -------------------------------------------------
-    # Loss dictionary (ADDED AS REQUESTED)
-    # -------------------------------------------------
+    # Logging Dictionary (For TQDM/WandB)
     loss_dict = {
         "Total": total.item(),
         "Adv": loss_adv.item(),
         "Pixel": loss_pix.item(),
         "Color": loss_color.item(),
         "Edge": loss_edge.item(),
+        "SSIM": loss_ssim.item() if ssim_fn else 0,
         "Depth": loss_depth.item() if depth is not None else 0
     }
 
