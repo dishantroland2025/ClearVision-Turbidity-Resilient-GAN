@@ -329,13 +329,13 @@ ssl._create_default_https_context = ssl._create_unverified_context
 # --- IMPORTS ---
 from models.ClearVision import ClearVisionGenerator, PatchGANDiscriminator
 from utils.dataset import TurbidDataset
-from utils.losses import generator_loss, PerceptualLoss, MSSSIMLoss
+from utils.losses import generator_loss, PerceptualLoss, SSIMLoss 
 
 def get_args():
     parser = argparse.ArgumentParser()
     
     # Identifiers & Paths
-    parser.add_argument("--name", type=str, default="ClearVision_Final_Stable", help="Experiment name")
+    parser.add_argument("--name", type=str, default="ClearVision_ConfigA_Final", help="Experiment name")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints/", help="Save location")
     parser.add_argument("--sample_dir", type=str, default="samples/", help="Test image location")
     parser.add_argument("--turbid_path", type=str, required=True)
@@ -348,21 +348,22 @@ def get_args():
     parser.add_argument("--use_amp", action='store_true')
     parser.add_argument("--resume", action='store_true', help="Resume from latest checkpoint")
 
-    # Architecture (Locked for Speed)
-    parser.add_argument("--ngf", type=int, default=32, help="Locked to 32 for Jetson Speed")
+    # Architecture
+    parser.add_argument("--ngf", type=int, default=32, help="Base channels (Model scales to 384 internal)")
     parser.add_argument("--ndf", type=int, default=128)
     
-    # --- SAFE CONFIGURATION (The Fix) ---
-    parser.add_argument("--lr", type=float, default=1e-4, help="Balanced LR for G and D (No oscillation)")
+    # --- OPTIMIZATION CONFIG ---
+    parser.add_argument("--lr", type=float, default=1e-4, help="Standard stable LR")
     
-    # Standard Weights (Paper-Grade / No Exploding Gradients)
-    parser.add_argument('--lambda_adv', type=float, default=1.0)   # Standard GAN balance
-    parser.add_argument('--lambda_pixel', type=float, default=10.0)
-    parser.add_argument('--lambda_ssim', type=float, default=1.0)  # Safe anchor (was 5.0)
-    parser.add_argument('--lambda_perc', type=float, default=1.0)  # Safe anchor (was 5.0)
-    parser.add_argument('--lambda_color', type=float, default=2.0) # Boosted slightly for brown water
-    parser.add_argument('--lambda_edge', type=float, default=0.5)
-    parser.add_argument('--lambda_depth', type=float, default=0.5)
+    # --- "CONFIG A" LOSS WEIGHTS (The Rescue Config) ---
+    # We follow Sea-Pix-GAN standards: Balanced L1 + GAN, SSIM as metric only.
+    parser.add_argument('--lambda_pixel', type=float, default=10.0)  # Reduced from 100 to prevent overfitting
+    parser.add_argument('--lambda_ssim', type=float, default=0.0)    # DISABLED for Optimization (Metric Only)
+    parser.add_argument('--lambda_adv', type=float, default=1.0)     # Increased from 0.05 to force learning
+    parser.add_argument('--lambda_perc', type=float, default=1.0)    # Standard VGG influence
+    parser.add_argument('--lambda_color', type=float, default=2.0)   # Brown water correction
+    parser.add_argument('--lambda_edge', type=float, default=0.5)    # Edge consistency
+    parser.add_argument('--lambda_depth', type=float, default=1.0)   # ENABLED: Physics guidance
     
     return parser.parse_args()
 
@@ -374,7 +375,7 @@ def main():
     os.makedirs(os.path.join(opt.checkpoint_dir, opt.name), exist_ok=True)
     os.makedirs(os.path.join(opt.sample_dir, opt.name), exist_ok=True)
 
-    # Save config for reference
+    # Save config
     with open(os.path.join(opt.checkpoint_dir, opt.name, 'config.json'), 'w') as f:
         json.dump(vars(opt), f, indent=4)
 
@@ -386,7 +387,7 @@ def main():
         if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
             torch.nn.init.normal_(m.weight.data, 0.0, 0.02)
     
-    # Balanced Optimizers (Standard Adam)
+    # Optimizers
     optimizer_G = torch.optim.Adam(generator.parameters(), lr=opt.lr, betas=(0.5, 0.999))
     optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=opt.lr, betas=(0.5, 0.999))
     scaler = torch.cuda.amp.GradScaler(enabled=opt.use_amp)
@@ -414,7 +415,9 @@ def main():
     from torchvision.models import vgg19, VGG19_Weights
     vgg = vgg19(weights=VGG19_Weights.DEFAULT).features.to(device).eval()
     perceptual_fn = PerceptualLoss(vgg).to(device)
-    ssim_fn = MSSSIMLoss().to(device)
+    
+    # SSIM initialized for LOGGING ONLY (Loss weight is 0.0)
+    ssim_fn = SSIMLoss(window_size=11).to(device)
 
     loss_weights = {
         "adv": opt.lambda_adv, "pixel": opt.lambda_pixel, 
@@ -430,21 +433,24 @@ def main():
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
     ])
     dataset = TurbidDataset(opt.turbid_path, opt.clear_path, opt.depth_path, transform=transform, augment=True)
-    dataloader = DataLoader(dataset, batch_size=opt.batch_size, shuffle=True, num_workers=2, pin_memory=True)
+    dataloader = DataLoader(dataset, batch_size=opt.batch_size, shuffle=True, num_workers=4, pin_memory=True)
 
-    print(f"--- Final Training: {opt.name} ---")
-    print(f"    Target: Stable Training (Beating 0.67 SSIM)")
-    print(f"    Fixes: Removed Label Smoothing, Reset LRs to 1e-4")
+    print(f"--- Training Configured for OCEANS 2026 (Config A) ---")
+    print(f"    Strategies: L1 Anchor (10.0), Active GAN (1.0), SSIM Metric Only")
+    print(f"    Warmup Extended to 30 Epochs")
+
+    
 
     # TRAINING LOOP
     for epoch in range(start_epoch, opt.epochs):
-        # Warmup for 20 epochs (Generator learns structure first)
-        if epoch < 20:
+        # Warmup Phase (Extended to 30 Epochs)
+        if epoch < 30:
             current_lambda_adv = 0.0
-            phase = "WARMUP"
+            phase = "WARMUP (L1 Only)"
         else:
             current_lambda_adv = opt.lambda_adv
-            phase = "GAN"
+            phase = "GAN (Refinement)"
+            
         loss_weights['adv'] = current_lambda_adv
         
         loop = tqdm(dataloader, desc=f"Epoch {epoch+1}/{opt.epochs} [{phase}]")
@@ -453,26 +459,31 @@ def main():
             turbid, clear, depth = turbid.to(device), clear.to(device), depth.to(device)
             
             # --- 1. TRAIN DISCRIMINATOR ---
-            optimizer_D.zero_grad()
-            with torch.cuda.amp.autocast(enabled=opt.use_amp):
-                fake_clear = generator(turbid)
-                pred_real = discriminator(clear, turbid)
-                pred_fake = discriminator(fake_clear.detach(), turbid)
-                
-                # BUG FIX: STRICT TARGETS (1.0 / 0.0)
-                # Removed Label Smoothing (0.9/0.1) to align with Generator Loss
-                loss_real = torch.mean((pred_real - 1.0) ** 2)
-                loss_fake = torch.mean((pred_fake - 0.0) ** 2)
-                loss_D = 0.5 * (loss_real + loss_fake)
+            # We only train D if we are out of the warmup phase
+            if epoch >= 30:
+                optimizer_D.zero_grad()
+                with torch.cuda.amp.autocast(enabled=opt.use_amp):
+                    fake_clear = generator(turbid)
+                    pred_real = discriminator(clear, turbid)
+                    pred_fake = discriminator(fake_clear.detach(), turbid)
+                    
+                    # LSGAN Loss (MSE) - Strict 1.0/0.0 targets
+                    loss_real = torch.mean((pred_real - 1.0) ** 2)
+                    loss_fake = torch.mean((pred_fake - 0.0) ** 2)
+                    loss_D = 0.5 * (loss_real + loss_fake)
 
-            scaler.scale(loss_D).backward()
-            scaler.step(optimizer_D)
-            
+                scaler.scale(loss_D).backward()
+                scaler.step(optimizer_D)
+                d_loss_val = loss_D.item()
+            else:
+                fake_clear = generator(turbid)
+                d_loss_val = 0.0
+
             # --- 2. TRAIN GENERATOR ---
             optimizer_G.zero_grad()
             with torch.cuda.amp.autocast(enabled=opt.use_amp):
-                # Note: generator_loss internally uses adversarial_loss which expects target=1.0.
-                # Since D is now trained with target=1.0 for real, the objectives are perfectly aligned.
+                # Note: ssim_fn is passed to calculate the metric, 
+                # but lambda_ssim=0.0 means it won't affect gradients.
                 loss_G, loss_dict = generator_loss(
                     discriminator, clear, fake_clear, turbid, depth, 
                     perceptual_fn, ssim_fn, loss_weights
@@ -482,21 +493,20 @@ def main():
             scaler.step(optimizer_G)
             scaler.update()
 
-            loop.set_postfix(SSIM=f"{loss_dict['SSIM']:.3f}", D_loss=f"{loss_D.item():.3f}")
+            loop.set_postfix(SSIM=f"{loss_dict.get('SSIM', 0):.3f}", D_loss=f"{d_loss_val:.3f}")
 
             if i == 0:
                 with torch.no_grad():
                     save_image(torch.cat((turbid, fake_clear, clear), -1), 
                              f"{opt.sample_dir}/{opt.name}/epoch_{epoch+1}.png", normalize=True)
 
-        # Save
+        # Save Checkpoint
         save_dict = {
             'epoch': epoch, 'G': generator.state_dict(), 'D': discriminator.state_dict(),
             'opt_G': optimizer_G.state_dict(), 'opt_D': optimizer_D.state_dict()
         }
         torch.save(save_dict, os.path.join(opt.checkpoint_dir, opt.name, "latest.pth"))
         
-        # Save history every 5 epochs
         if (epoch+1) % 5 == 0:
             torch.save(generator.state_dict(), os.path.join(opt.checkpoint_dir, opt.name, f"epoch_{epoch+1}.pth"))
 

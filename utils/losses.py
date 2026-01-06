@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import kornia.color as K
 import kornia.filters as KF
 import math
+from math import exp
 
 # ==========================================
 # 1. ADVERSARIAL LOSS (LSGAN)
@@ -23,7 +24,6 @@ def adversarial_loss(pred, target_is_real=True):
 def pixel_loss(fake, real):
     """
     Standard L1 Loss. Enforces pixel-wise accuracy.
-    Good for low-frequency content (colors, general brightness).
     """
     return torch.mean(torch.abs(fake - real))
 
@@ -34,9 +34,7 @@ def pixel_loss(fake, real):
 def lab_color_loss(fake, real):
     """
     Computes L1 loss only on 'a' and 'b' channels of CIELAB space.
-    Crucial for underwater correction:
-    - 'a' channel: Green-Red axis (fixes heavy green cast).
-    - 'b' channel: Blue-Yellow axis (fixes blue haze).
+    Crucial for underwater correction.
     """
     # Convert [-1, 1] RGB -> [0, 1] RGB -> LAB
     fake_lab = K.rgb_to_lab((fake + 1) / 2)
@@ -54,8 +52,7 @@ def lab_color_loss(fake, real):
 def edge_loss(fake, real):
     """
     Computes gradients (edges) using Sobel filters.
-    Forces the generator to recover high-frequency details (sand texture, coral edges)
-    which L1 loss tends to blur.
+    Forces recovery of high-frequency details.
     """
     fake_edges = KF.sobel(fake)
     real_edges = KF.sobel(real)
@@ -68,8 +65,6 @@ def edge_loss(fake, real):
 def depth_weighted_loss(fake, real, depth, max_depth=1.0):
     """
     Weights the pixel loss based on water depth.
-    Physics Logic: Attenuation is exponential with depth. Errors in deep regions
-    are physically harder to correct and should be penalized more.
     """
     if depth.dim() == 3:
         depth = depth.unsqueeze(1) # Ensure [B, 1, H, W]
@@ -80,49 +75,68 @@ def depth_weighted_loss(fake, real, depth, max_depth=1.0):
 
 
 # ==========================================
-# 6. MS-SSIM LOSS (Structural Similarity)
+# 6. STANDARD SSIM LOSS (Replaces MS-SSIM)
 # ==========================================
-class MSSSIMLoss(nn.Module):
-    """
-    Multi-Scale Structural Similarity Loss.
-    Standard metric for Image Enhancement papers.
-    Optimizes for structural fidelity rather than just pixel accuracy.
-    """
-    def __init__(self, window_size=11, channel=3):
-        super(MSSSIMLoss, self).__init__()
-        self.window_size = window_size
-        self.channel = channel
-        
-    def _gaussian(self, window_size, sigma):
-        gauss = torch.Tensor([math.exp(-(x - window_size//2)**2/float(2*sigma**2)) for x in range(window_size)])
-        return gauss/gauss.sum()
+def gaussian(window_size, sigma):
+    gauss = torch.Tensor([exp(-(x - window_size//2)**2/float(2*sigma**2)) for x in range(window_size)])
+    return gauss/gauss.sum()
 
-    def _create_window(self, window_size, channel):
-        _1D_window = self._gaussian(window_size, 1.5).unsqueeze(1)
-        _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
-        window = _2D_window.expand(channel, 1, window_size, window_size).contiguous()
-        return window
+def create_window(window_size, channel):
+    _1D_window = gaussian(window_size, 1.5).unsqueeze(1)
+    _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
+    window = _2D_window.expand(channel, 1, window_size, window_size).contiguous()
+    return window
 
-    def _ssim(self, img1, img2, window, window_size, channel):
-        mu1 = F.conv2d(img1, window, padding=window_size//2, groups=channel)
-        mu2 = F.conv2d(img2, window, padding=window_size//2, groups=channel)
-        mu1_sq = mu1.pow(2); mu2_sq = mu2.pow(2); mu1_mu2 = mu1*mu2
-        sigma1_sq = F.conv2d(img1*img1, window, padding=window_size//2, groups=channel) - mu1_sq
-        sigma2_sq = F.conv2d(img2*img2, window, padding=window_size//2, groups=channel) - mu2_sq
-        sigma12 = F.conv2d(img1*img2, window, padding=window_size//2, groups=channel) - mu1_mu2
-        C1 = 0.01**2; C2 = 0.03**2
-        ssim_map = ((2*mu1_mu2 + C1)*(2*sigma12 + C2))/((mu1_sq + mu2_sq + C1)*(sigma1_sq + sigma2_sq + C2))
+def _ssim(img1, img2, window, window_size, channel, size_average=True):
+    mu1 = F.conv2d(img1, window, padding=window_size//2, groups=channel)
+    mu2 = F.conv2d(img2, window, padding=window_size//2, groups=channel)
+
+    mu1_sq = mu1.pow(2)
+    mu2_sq = mu2.pow(2)
+    mu1_mu2 = mu1*mu2
+
+    sigma1_sq = F.conv2d(img1*img1, window, padding=window_size//2, groups=channel) - mu1_sq
+    sigma2_sq = F.conv2d(img2*img2, window, padding=window_size//2, groups=channel) - mu2_sq
+    sigma12 = F.conv2d(img1*img2, window, padding=window_size//2, groups=channel) - mu1_mu2
+
+    C1 = 0.01**2
+    C2 = 0.03**2
+
+    ssim_map = ((2*mu1_mu2 + C1)*(2*sigma12 + C2))/((mu1_sq + mu2_sq + C1)*(sigma1_sq + sigma2_sq + C2))
+
+    if size_average:
         return ssim_map.mean()
+    else:
+        return ssim_map.mean(1).mean(1).mean(1)
+
+class SSIMLoss(torch.nn.Module):
+    """
+    Standard SSIM Loss.
+    We prefer this over MS-SSIM for Turbid River data because downsampling (in MS-SSIM)
+    destroys the fine grain of sediment, leading to blurry results.
+    """
+    def __init__(self, window_size=11, size_average=True):
+        super(SSIMLoss, self).__init__()
+        self.window_size = window_size
+        self.size_average = size_average
+        self.channel = 1
+        self.window = create_window(window_size, self.channel)
 
     def forward(self, img1, img2):
-        if img1.is_cuda:
-            window = self._create_window(self.window_size, self.channel).cuda(img1.get_device())
+        (_, channel, _, _) = img1.size()
+
+        if channel == self.channel and self.window.data.type() == img1.data.type():
+            window = self.window
         else:
-            window = self._create_window(self.window_size, self.channel)
-        
-        # Invert SSIM (1 is perfect, so Loss = 1 - SSIM)
-        # Mix with L1 for stability (Zhao et al. MixLoss)
-        return 0.84 * (1 - self._ssim(img1, img2, window, self.window_size, self.channel)) + 0.16 * torch.mean(torch.abs(img1 - img2))
+            window = create_window(self.window_size, channel)
+            if img1.is_cuda:
+                window = window.cuda(img1.get_device())
+            window = window.type_as(img1)
+            self.window = window
+            self.channel = channel
+
+        # Return 1 - SSIM (Minimize distance)
+        return 1.0 - _ssim(img1, img2, window, self.window_size, channel, self.size_average)
 
 
 # ==========================================
@@ -131,8 +145,6 @@ class MSSSIMLoss(nn.Module):
 class PerceptualLoss(nn.Module):
     """
     Computes distance between feature maps of VGG-19.
-    Ensures generated image matches 'semantic content' of ground truth,
-    not just pixel values.
     """
     def __init__(self, vgg):
         super().__init__()
@@ -176,14 +188,13 @@ def generator_loss(
     depth=None,
     max_depth=1.0,
     perceptual_fn=None,
-    ssim_fn=None, # <--- Added support for SSIM
+    ssim_fn=None, 
     lambdas=None
 ):
     """
     Aggregates all 7 loss components into a single scalar.
     """
     # 1. Adversarial Loss (Fool the Discriminator)
-    # PatchGAN D input: [Fake, Turbid]
     pred_fake = D(fake_img, input_img)
     loss_adv = adversarial_loss(pred_fake, True)
 
@@ -212,7 +223,7 @@ def generator_loss(
         lambdas["depth"] * loss_depth
     )
 
-    # Logging Dictionary (For TQDM/WandB)
+    # Logging Dictionary
     loss_dict = {
         "Total": total.item(),
         "Adv": loss_adv.item(),
