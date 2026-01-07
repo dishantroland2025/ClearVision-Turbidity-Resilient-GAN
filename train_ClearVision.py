@@ -482,11 +482,17 @@ def main():
             # --- 2. TRAIN GENERATOR ---
             optimizer_G.zero_grad()
             with torch.cuda.amp.autocast(enabled=opt.use_amp):
-                # Note: ssim_fn is passed to calculate the metric, 
-                # but lambda_ssim=0.0 means it won't affect gradients.
+                # FIX APPLIED HERE: Using Keyword Arguments
                 loss_G, loss_dict = generator_loss(
-                    discriminator, clear, fake_clear, turbid, depth, 
-                    perceptual_fn, ssim_fn, loss_weights
+                    D=discriminator,
+                    real_img=clear,
+                    fake_img=fake_clear,
+                    input_img=turbid,
+                    depth=depth,
+                    max_depth=1.0,
+                    perceptual_fn=perceptual_fn,
+                    ssim_fn=ssim_fn,
+                    lambdas=loss_weights
                 )
 
             scaler.scale(loss_G).backward()

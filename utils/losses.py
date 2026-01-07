@@ -12,7 +12,6 @@ from math import exp
 def adversarial_loss(pred, target_is_real=True):
     """
     Least Squares GAN Loss (Mao et al.).
-    More stable than BCE Loss, prevents vanishing gradients.
     """
     target = torch.ones_like(pred) if target_is_real else torch.zeros_like(pred)
     return torch.mean((pred - target) ** 2)
@@ -34,7 +33,6 @@ def pixel_loss(fake, real):
 def lab_color_loss(fake, real):
     """
     Computes L1 loss only on 'a' and 'b' channels of CIELAB space.
-    Crucial for underwater correction.
     """
     # Convert [-1, 1] RGB -> [0, 1] RGB -> LAB
     fake_lab = K.rgb_to_lab((fake + 1) / 2)
@@ -52,7 +50,6 @@ def lab_color_loss(fake, real):
 def edge_loss(fake, real):
     """
     Computes gradients (edges) using Sobel filters.
-    Forces recovery of high-frequency details.
     """
     fake_edges = KF.sobel(fake)
     real_edges = KF.sobel(real)
@@ -224,13 +221,20 @@ def generator_loss(
     )
 
     # Logging Dictionary
+    # FIX: Convert 'loss_ssim' back to 'SSIM Score' for display consistency
+    # ssim_fn returns (1 - SSIM). So we do (1 - loss) to get the Score back.
+    
+    current_ssim_score = 0
+    if ssim_fn:
+        current_ssim_score = 1.0 - loss_ssim.item()
+
     loss_dict = {
         "Total": total.item(),
         "Adv": loss_adv.item(),
         "Pixel": loss_pix.item(),
         "Color": loss_color.item(),
         "Edge": loss_edge.item(),
-        "SSIM": loss_ssim.item() if ssim_fn else 0,
+        "SSIM": current_ssim_score, # Log the Score (e.g., 0.82), not the Loss (0.18)
         "Depth": loss_depth.item() if depth is not None else 0
     }
 
