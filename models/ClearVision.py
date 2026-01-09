@@ -8,10 +8,6 @@ import math
 # ==========================================
 
 class StandardResBlock(nn.Module):
-    """
-    Standard ResNet block. 
-    Structure: Conv3x3 -> BN -> ReLU -> Conv3x3 -> BN -> Add Residual -> ReLU
-    """
     def __init__(self, channels):
         super(StandardResBlock, self).__init__()
         self.conv1 = nn.Conv2d(channels, channels, 3, 1, 1, bias=False)
@@ -29,10 +25,6 @@ class StandardResBlock(nn.Module):
         return out
 
 class SEBlock(nn.Module):
-    """
-    Squeeze-and-Excitation block.
-    OCEANS FIX: Only used in the deepest skip connection (Enc4).
-    """
     def __init__(self, channels, reduction=16):
         super(SEBlock, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
@@ -48,14 +40,11 @@ class SEBlock(nn.Module):
         return x * y
 
 class ECABlock(nn.Module):
-    """
-    Efficient Channel Attention (ECA-Net).
-    """
     def __init__(self, channels, gamma=2, b=1):
         super(ECABlock, self).__init__()
         t = int(abs((math.log(channels, 2) + b) / gamma))
         k_size = t if t % 2 else t + 1
-        
+
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
         self.sigmoid = nn.Sigmoid()
@@ -67,9 +56,6 @@ class ECABlock(nn.Module):
         return x * y.expand_as(x)
 
 class CBAM(nn.Module):
-    """
-    Convolutional Block Attention Module.
-    """
     def __init__(self, channels, reduction=16):
         super(CBAM, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
@@ -92,24 +78,19 @@ class CBAM(nn.Module):
         return x * ms
 
 class SimplifiedTripletAttention(nn.Module):
-    """
-    Physics-aware attention. Kept only in Bottleneck.
-    """
     def __init__(self):
         super(SimplifiedTripletAttention, self).__init__()
         self.conv = nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        # 1. Channel-Height Interaction
-        x_perm1 = x.permute(0, 3, 2, 1) 
+        x_perm1 = x.permute(0, 3, 2, 1)
         max1, _ = torch.max(x_perm1, dim=1, keepdim=True)
         avg1 = torch.mean(x_perm1, dim=1, keepdim=True)
         att1 = self.sigmoid(self.conv(torch.cat([max1, avg1], dim=1)))
         out1 = (x_perm1 * att1).permute(0, 3, 2, 1)
 
-        # 2. Channel-Width Interaction
-        x_perm2 = x.permute(0, 2, 1, 3) 
+        x_perm2 = x.permute(0, 2, 1, 3)
         max2, _ = torch.max(x_perm2, dim=1, keepdim=True)
         avg2 = torch.mean(x_perm2, dim=1, keepdim=True)
         att2 = self.sigmoid(self.conv(torch.cat([max2, avg2], dim=1)))
@@ -118,9 +99,6 @@ class SimplifiedTripletAttention(nn.Module):
         return (out1 + out2) / 2.0
 
 class MultiScaleColorCorrection(nn.Module):
-    """
-    Physics-Informed Novelty Block.
-    """
     def __init__(self, channels):
         super(MultiScaleColorCorrection, self).__init__()
         self.global_branch = nn.Sequential(
@@ -138,74 +116,68 @@ class MultiScaleColorCorrection(nn.Module):
         l = self.local_branch(x)
         return x * ((g + l) / 2.0)
 
-# ==========================================
-# 2. MAIN GENERATOR (OCEANS OPTIMIZED)
-# ==========================================
+
+# 2. GENERATOR 
 
 class ClearVisionGenerator(nn.Module):
-    def __init__(self, input_nc=3, output_nc=3, ngf=32):
+    def __init__(self, input_nc=3, output_nc=3, ngf=48):
         super(ClearVisionGenerator, self).__init__()
 
         # --- ENCODER ---
         self.initial_conv = nn.Sequential(
-            nn.Conv2d(input_nc, ngf, 7, 1, 3, bias=False), 
+            nn.Conv2d(input_nc, ngf, 7, 1, 3, bias=False),
             nn.BatchNorm2d(ngf), nn.ReLU(True)
         )
-
-        # 32 -> 64
+        # 256 -> 128
         self.enc1 = StandardResBlock(ngf)
         self.down1 = nn.Conv2d(ngf, ngf*2, 3, 2, 1, bias=False)
 
-        # 64 -> 128
+        # 128 -> 64
         self.enc2 = StandardResBlock(ngf*2)
         self.down2 = nn.Conv2d(ngf*2, ngf*4, 3, 2, 1, bias=False)
 
-        # 128 -> 256
+        # 64 -> 64 (NO DOWNSAMPLING - Resolution Boost)
         self.enc3 = StandardResBlock(ngf*4)
-        self.expand4 = nn.Conv2d(ngf*4, ngf*8, 1, 1, 0, bias=False) 
-        self.enc4 = nn.Sequential(StandardResBlock(ngf*8), CBAM(ngf*8)) 
-        
-        # 256 -> 384 (Hardcoded High Capacity Bottleneck)
-        self.down4 = nn.Conv2d(ngf*8, 384, 3, 2, 1, bias=False)
 
-        # --- BOTTLENECK (High Capacity) ---
+        # [REMOVED] self.down4
+        # We cap channels at 256 (ngf*8) instead of 384 for SPEED
+        self.expand_to_bottle = nn.Conv2d(ngf*4, 256, 1, 1, 0, bias=False)
+
+        # --- BOTTLENECK (High Res 64x64, but Slimmer 256ch) ---
+        # Reduced depth slightly to ensure 60+ FPS
         self.bottleneck_pre = nn.Sequential(
-            StandardResBlock(384), StandardResBlock(384), StandardResBlock(384)
+            StandardResBlock(256), StandardResBlock(256)
         )
+        # Triplet modified for 256 channels
         self.triplet = SimplifiedTripletAttention()
-        self.bn_triplet = nn.BatchNorm2d(384) 
+        self.bn_triplet = nn.BatchNorm2d(256)
         self.bottleneck_post = nn.Sequential(
-            StandardResBlock(384), StandardResBlock(384), StandardResBlock(384), StandardResBlock(384)
+            StandardResBlock(256), StandardResBlock(256), StandardResBlock(256)
         )
-        self.mscc = MultiScaleColorCorrection(channels=384)
+        self.mscc = MultiScaleColorCorrection(channels=256)
 
         # --- DECODER ---
-        
-        # D1: Upsample 32 -> 64. Channels 384 -> 256.
-        self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.bn_up1 = nn.BatchNorm2d(384) 
-        
-        # [KEPT] SE Gate on Deepest Skip (Filters Semantic Noise)
-        self.skip_att1 = SEBlock(ngf*8)   
-        
-        self.reduce1 = nn.Conv2d(384 + ngf*8, ngf*8, 1, 1, 0, bias=False)
-        self.dec1 = nn.Sequential(StandardResBlock(ngf*8), ECABlock(ngf*8))
 
-        # D2: Upsample 64 -> 128. Channels 256 -> 128.
+        # D1: No Upsample (Already 64x64)
+        # Skip Connection 3 (Enc3 was 64x64, ngf*4=128)
+        self.skip_att_deep = SEBlock(ngf*4)
+
+        # Input: Bottleneck(256) + Skip(128) = 384 channels
+        # Output: 128 channels (ngf*4)
+        self.reduce1 = nn.Conv2d(256 + ngf*4, ngf*4, 1, 1, 0, bias=False)
+        self.dec1 = nn.Sequential(StandardResBlock(ngf*4), ECABlock(ngf*4))
+
+        # D2: Upsample 64 -> 128
         self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        
-        # [REMOVED] SE Block from Shallow Skip (Unlocks Texture Flow)
-        # self.skip_att2 = SEBlock(ngf*2) 
-        
-        self.reduce2 = nn.Conv2d(ngf*8 + ngf*2, ngf*2, 1, 1, 0, bias=False)
+        # Input: up(128) + skip_enc2(64) = 192 channels
+        # Output: 64 channels (ngf*2)
+        self.reduce2 = nn.Conv2d(ngf*4 + ngf*2, ngf*2, 1, 1, 0, bias=False)
         self.dec2 = nn.Sequential(StandardResBlock(ngf*2), ECABlock(ngf*2))
 
-        # D3: Upsample 128 -> 256. Channels 64 -> 32.
+        # D3: Upsample 128 -> 256
         self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        
-        # [REMOVED] SE Block from Shallow Skip (Unlocks Texture Flow)
-        # self.skip_att3 = SEBlock(ngf)
-        
+        # Input: up(64) + skip_enc1(32) = 96 channels
+        # Output: 32 channels (ngf)
         self.reduce3 = nn.Conv2d(ngf*2 + ngf, ngf, 1, 1, 0, bias=False)
         self.dec3 = nn.Sequential(StandardResBlock(ngf), ECABlock(ngf))
 
@@ -213,58 +185,47 @@ class ClearVisionGenerator(nn.Module):
 
     def forward(self, x):
         # --- ENCODER ---
-        x0 = self.initial_conv(x)
+        x0 = self.initial_conv(x) # 256
         r1 = self.enc1(x0)
-        
-        x1 = self.down1(r1)
+
+        x1 = self.down1(r1)       # 128
         r2 = self.enc2(x1)
-        
-        x2 = self.down2(r2)
+
+        x2 = self.down2(r2)       # 64
         r3 = self.enc3(x2)
-        
-        x3_exp = self.expand4(r3)
-        r4 = self.enc4(x3_exp)
-        
-        x4 = self.down4(r4)
+
+        # Expansion to Bottleneck
+        x_bottle = self.expand_to_bottle(r3) # 64x64, 256ch
 
         # --- BOTTLENECK ---
-        b = self.bottleneck_pre(x4)
+        b = self.bottleneck_pre(x_bottle)
         b = self.triplet(b)
         b = self.bn_triplet(b)
         b = self.bottleneck_post(b)
         b = self.mscc(b)
 
         # --- DECODER ---
-        # D1
-        u1 = self.bn_up1(self.up1(b))
-        s1 = self.skip_att1(r4) # [KEPT] Deepest SE Gate
-        d1 = self.dec1(self.reduce1(torch.cat([u1, s1], dim=1)))
+        s1 = self.skip_att_deep(r3)
+        d1 = self.dec1(self.reduce1(torch.cat([b, s1], dim=1)))
 
-        # D2
         u2 = self.up2(d1)
-        # s2 = self.skip_att2(r2) [REMOVED]
-        d2 = self.dec2(self.reduce2(torch.cat([u2, r2], dim=1))) # Direct Skip
+        d2 = self.dec2(self.reduce2(torch.cat([u2, r2], dim=1)))
 
-        # D3
         u3 = self.up3(d2)
-        # s3 = self.skip_att3(r1) [REMOVED]
-        d3 = self.dec3(self.reduce3(torch.cat([u3, r1], dim=1))) # Direct Skip
+        d3 = self.dec3(self.reduce3(torch.cat([u3, r1], dim=1)))
 
         return self.final(d3)
     
-
-# ==========================================
-# 3. DISCRIMINATOR
-# ==========================================
+# 2. DISCRIMINATOR     
 
 class PatchGANDiscriminator(nn.Module):
     def __init__(self, input_nc=3, ndf=128):
         super(PatchGANDiscriminator, self).__init__()
-        
+
         def discriminator_block(in_filters, out_filters, normalization=True):
             layers = [nn.utils.spectral_norm(nn.Conv2d(in_filters, out_filters, 4, stride=2, padding=1, bias=False))]
             if normalization:
-                layers.append(nn.BatchNorm2d(out_filters)) 
+                layers.append(nn.BatchNorm2d(out_filters))
             layers.append(nn.LeakyReLU(0.2, inplace=True))
             return layers
 

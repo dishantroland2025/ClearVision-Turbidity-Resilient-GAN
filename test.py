@@ -18,9 +18,9 @@ def main():
     parser.add_argument("--results_dir", type=str, default="./results", help="Where to save cleaned images")
     parser.add_argument("--checkpoint_path", type=str, required=True, help="Path to generator .pth file")
     
-    # --- ARCHITECTURE FLAGS (Phase 2) ---
-    # Default is 32 to match your Jetson optimization
-    parser.add_argument("--ngf", type=int, default=32, help="Generator capacity (Must match training!)")
+    # --- ARCHITECTURE FLAGS ---
+    # UPDATED DEFAULT: 48 to match your "Golden" Standard Model
+    parser.add_argument("--ngf", type=int, default=48, help="Generator capacity (Must match training!)")
     
     opt = parser.parse_args()
 
@@ -29,29 +29,39 @@ def main():
     os.makedirs(opt.results_dir, exist_ok=True)
     
     # 2. Load Model
-    print(f" Loading ClearVision Phase 2 (ngf={opt.ngf})...")
+    print(f" Loading ClearVision Standard (ngf={opt.ngf})...")
     print(f"  From: {opt.checkpoint_path}")
     
-    # Initialize Model (Phase 2 has MSCC and Triplet built-in, so no flags needed)
     generator = ClearVisionGenerator(ngf=opt.ngf).to(device)
     
     # Load weights
     try:
         checkpoint = torch.load(opt.checkpoint_path, map_location=device)
-        # Handle both raw state_dict and checkpoint dictionaries
-        if 'state_dict' in checkpoint:
+        
+        # FIX: Check for 'G' (used in your training script) or raw state_dict
+        if 'G' in checkpoint:
+            generator.load_state_dict(checkpoint['G'])
+            print("  [INFO] Loaded weights from key: 'G' (Full Checkpoint)")
+        elif 'state_dict' in checkpoint:
             generator.load_state_dict(checkpoint['state_dict'])
+            print("  [INFO] Loaded weights from key: 'state_dict'")
         else:
+            # Assume raw state dict
             generator.load_state_dict(checkpoint)
-        print("  Weights loaded successfully.")
+            print("  [INFO] Loaded raw state dictionary")
+            
     except Exception as e:
-        print(f" Error loading checkpoint: {e}")
-        print(f"  (Tip: Ensure you trained with --ngf {opt.ngf})")
+        print(f"\n[ERROR] Failed to load checkpoint!")
+        print(f"Details: {e}")
+        print(f"Tip: Did you train with --ngf {opt.ngf}?")
         return
 
     generator.eval()
 
-    # 3. Define Transforms (No Augmentation for Testing)
+    # 3. Define Transforms (Matches Training)
+    # Note: If your test images are already 256x256, Resize is harmless. 
+    # If they are different aspect ratios, Resize((256,256)) might distort them. 
+    # For benchmarking, 256x256 is standard.
     transform = transforms.Compose([
         transforms.Resize((256, 256), Image.BICUBIC),
         transforms.ToTensor(),
@@ -60,7 +70,6 @@ def main():
 
     # 4. Process Images
     test_files = sorted(glob(join(opt.turbid_path, "*.*")))
-    # Filter for valid image extensions
     valid_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.tif')
     test_files = [f for f in test_files if f.lower().endswith(valid_exts)]
     
@@ -86,15 +95,14 @@ def main():
                 torch.cuda.synchronize()
             end_time = time.time()
             
-            # Skip first run (warmup) for timing stats
-            if i > 0: 
+            # Skip first 2 runs (warmup) for timing stats
+            if i > 2: 
                 times.append(end_time - start_time)
 
             # Save Result
             save_path = join(opt.results_dir, img_name)
             save_image(fake_img, save_path, normalize=True)
             
-            # Optional: Print progress every 10 images
             if (i+1) % 10 == 0:
                 print(f"  Processed {i+1}/{len(test_files)}")
 
@@ -110,7 +118,7 @@ def main():
         print(f" Saved to: {opt.results_dir}")
         print(f"------------------------------------------------\n")
     else:
-        print("Warning: No images processed or only 1 image (warmup only).")
+        print("Warning: Not enough images for FPS calc (Need >2).")
 
 if __name__ == "__main__":
     main()

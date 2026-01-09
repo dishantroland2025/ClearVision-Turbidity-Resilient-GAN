@@ -72,7 +72,7 @@ def depth_weighted_loss(fake, real, depth, max_depth=1.0):
 
 
 # ==========================================
-# 6. STANDARD SSIM LOSS (Replaces MS-SSIM)
+# 6. STANDARD SSIM LOSS
 # ==========================================
 def gaussian(window_size, sigma):
     gauss = torch.Tensor([exp(-(x - window_size//2)**2/float(2*sigma**2)) for x in range(window_size)])
@@ -107,11 +107,7 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
         return ssim_map.mean(1).mean(1).mean(1)
 
 class SSIMLoss(torch.nn.Module):
-    """
-    Standard SSIM Loss.
-    We prefer this over MS-SSIM for Turbid River data because downsampling (in MS-SSIM)
-    destroys the fine grain of sediment, leading to blurry results.
-    """
+    
     def __init__(self, window_size=11, size_average=True):
         super(SSIMLoss, self).__init__()
         self.window_size = window_size
