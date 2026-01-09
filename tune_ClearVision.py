@@ -16,8 +16,8 @@ from utils.dataset import TurbidDataset
 from utils.losses import generator_loss, PerceptualLoss, MSSSIMLoss
 
 # --- CONFIG ---
-SEARCH_EPOCHS = 15     # Pruning will catch bad trials early
-TOTAL_TRIALS = 100     # <--- 100 Trials for statistical significance
+SEARCH_EPOCHS = 15     
+TOTAL_TRIALS = 100     
 IMG_SIZE = 256
 
 # --- HELPER: PSNR ---
@@ -28,30 +28,27 @@ def calculate_psnr(img1, img2):
     return 20 * torch.log10(1.0 / torch.sqrt(mse))
 
 def objective(trial):
-    # 1. Search Space (REDUCED to 5 Critical Parameters + Batch Size/LR)
-    
-    # Architecture & Optimization
+    # 1. Search Space
     batch_size = trial.suggest_categorical("batch_size", [4, 8])
     lr = trial.suggest_float("lr", 1e-4, 5e-4, log=True)
     
-    # Loss Weights (The "Recipe" Ratios)
-    # Note: Pixel and Color are FIXED ANCHORS. We tune the others around them.
-    lambda_ssim  = trial.suggest_float("lambda_ssim", 0.1, 1.0)   # Structure
-    lambda_depth = trial.suggest_float("lambda_depth", 0.1, 5.0)  # Physics
-    lambda_perc  = trial.suggest_float("lambda_perc", 0.01, 0.5)  # Perceptual
-    lambda_edge  = trial.suggest_float("lambda_edge", 0.1, 2.0)   # Sharpness
-    lambda_adv   = trial.suggest_float("lambda_adv", 0.01, 0.2)   # Realism
+    # Loss Weights
+    lambda_ssim  = trial.suggest_float("lambda_ssim", 0.1, 1.0)
+    lambda_depth = trial.suggest_float("lambda_depth", 0.1, 5.0)
+    lambda_perc  = trial.suggest_float("lambda_perc", 0.01, 0.5)
+    lambda_edge  = trial.suggest_float("lambda_edge", 0.1, 2.0)
+    lambda_adv   = trial.suggest_float("lambda_adv", 0.01, 0.2)
 
     # 2. Setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # PATHS (UPDATE THESE FOR YOUR CLUSTER STORAGE!)
+    # ⚠️ UPDATE THESE PATHS BEFORE RUNNING ⚠️
     TURBID_PATH = "/path/to/Sorted-UIEB/Raw"
     CLEAR_PATH = "/path/to/Sorted-UIEB/GT"
     DEPTH_PATH = "/path/to/Sorted-UIEB/depths"
     
     try:
-        # Init Models (Phase 2 Fixed Specs)
+        # Init Models
         generator = ClearVisionGenerator(ngf=32).to(device)
         discriminator = PatchGANDiscriminator(ndf=128).to(device) 
         
@@ -67,11 +64,10 @@ def objective(trial):
         perceptual_fn = PerceptualLoss(vgg).to(device)
         ssim_fn = MSSSIMLoss().to(device)
         
-        # Pack Lambdas (ANCHORS FIXED HERE)
         lambdas = {
             "adv": lambda_adv, 
-            "pixel": 10.0,       # <--- FIXED ANCHOR 1
-            "color": 0.5,        # <--- FIXED ANCHOR 2
+            "pixel": 10.0,       
+            "color": 0.5,        
             "edge": lambda_edge, 
             "perc": lambda_perc, 
             "ssim": lambda_ssim, 
@@ -84,11 +80,9 @@ def objective(trial):
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
         ])
         
-        # Train (Augmented internally), Val (No Augment)
         train_dataset = TurbidDataset(TURBID_PATH, CLEAR_PATH, DEPTH_PATH, transform=base_transform, augment=True)
         val_dataset_raw = TurbidDataset(TURBID_PATH, CLEAR_PATH, DEPTH_PATH, transform=base_transform, augment=False)
         
-        # Split Logic
         total_len = len(train_dataset)
         val_len = int(0.1 * total_len)
         train_len = total_len - val_len
@@ -118,9 +112,17 @@ def objective(trial):
                 optimizer_G.zero_grad()
                 with torch.cuda.amp.autocast():
                     fake_clear = generator(turbid)
+                    
+                    # [MODIFICATION]: KEYWORD ARGUMENTS ONLY (Prevents Positional Crashes)
                     loss_G, _ = generator_loss(
-                        discriminator, clear, fake_clear, turbid, depth, 
-                        perceptual_fn=perceptual_fn, ssim_fn=ssim_fn, lambdas=lambdas
+                        D=discriminator, 
+                        real_img=clear, 
+                        fake_img=fake_clear, 
+                        input_img=turbid, 
+                        depth=depth, 
+                        perceptual_fn=perceptual_fn, 
+                        ssim_fn=ssim_fn, 
+                        lambdas=lambdas
                     )
                 
                 scaler.scale(loss_G).backward()
@@ -148,7 +150,6 @@ def objective(trial):
             with torch.no_grad():
                 for v_turbid, v_clear, _ in val_loader:
                     v_turbid, v_clear = v_turbid.to(device), v_clear.to(device)
-                    # Denormalize: [-1, 1] -> [0, 1]
                     v_fake = (generator(v_turbid) + 1) / 2.0
                     v_clear_dn = (v_clear + 1) / 2.0
                     total_psnr += calculate_psnr(v_clear_dn, v_fake)
@@ -181,7 +182,6 @@ def objective(trial):
         gc.collect()
 
 if __name__ == "__main__":
-    # IMPORTANT: Use absolute path for DB to handle re-submissions correctly
     db_path = os.path.abspath("optuna_clearvision_phase2.db")
     storage_url = f"sqlite:///{db_path}"
     study_name = "cv_phase2_anchored"
