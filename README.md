@@ -165,5 +165,20 @@ python test.py \
 | SGUIE-Net | 17.301 | 0.683 | 3.169 | 17.0 | 16.4 |
 | ClearVision (Ours) | **18.612** | 0.706 | **3.171** | 9.1 | 49.8 |
 
+## Visual Comparison
+
+<p align="center">
+  <img src="Comparison_Images.png" width="95%" >
+</p>
+
+<p align="center">
+  <em>
+Fig : Qualitative comparison on the Turbid-imagery dataset
+across different underwater image enhancement models.
+  </em>
+</p>
+
+---
+
 
 
