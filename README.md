@@ -168,7 +168,7 @@ python test.py \
 ## Visual Comparison
 
 <p align="center">
-  <img src="Comparison_Images.png" width="95%" >
+  <img src="Comparison_Image.png" width="95%" >
 </p>
 
 <p align="center">
