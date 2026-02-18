@@ -1,7 +1,7 @@
 
 # ClearVision: Seeing Through Turbidity
 
-**A Physics-Informed Lightweight CNN for Real-Time Enhancement of Sediment-Degraded Underwater Imagery**
+**A Physics-Informed Lightweight GAN for Real-Time Enhancement of Sediment-Degraded Underwater Imagery**
 
 ---
 
