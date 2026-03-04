@@ -13,7 +13,38 @@
 * **Real-Time:** Runs at 50 FPS (on T4 GPU).
 * **Physics-Informed:** Incorporates depth-weighted attenuation and CIELAB color constraints.
 * **Robotic Utility:** Increases valid ORB feature matches by 16x (from 1.88 to 32.77), enabling VSLAM in blind conditions.
+---
 
+## Architecture
+
+The ClearVision framework is built around a **lightweight physics-informed GAN architecture** designed to restore visibility in highly turbid underwater environments.
+
+<p align="center">
+  <img src="docs/architecture.png" width="95%">
+</p>
+
+<p align="center">
+<em>
+Figure: Overview of the ClearVision architecture integrating physics-aware priors with lightweight adversarial learning.
+</em>
+</p>
+
+### Generator
+
+The generator is designed to recover visibility from sediment-scattered imagery while maintaining computational efficiency for real-time operation.  
+It incorporates:
+
+- **Depth-weighted attenuation modeling** to compensate for scattering effects.
+- **CIELAB color constraints** to stabilize color restoration.
+- **Edge-aware reconstruction** to preserve structural details in degraded scenes.
+
+### Discriminator
+
+The discriminator evaluates the realism of generated outputs using adversarial learning while encouraging:
+
+- Natural underwater texture reconstruction
+- Realistic luminance distribution
+- Reduced over-enhancement artifacts
 ---
 
 ## Setup & Installation
