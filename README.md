@@ -1,8 +1,6 @@
-<img width="629" height="302" alt="Generator_Architecture" src="https://github.com/user-attachments/assets/701c44b4-77cf-479f-90cb-7a98a22e8026" />
 # ClearVision: Seeing Through Turbidity
 
 **A Physics-Informed Lightweight GAN for Real-Time Enhancement of Sediment-Degraded Underwater Imagery**
-
 ---
 
 ## Overview
