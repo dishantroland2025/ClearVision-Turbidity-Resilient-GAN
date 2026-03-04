@@ -238,7 +238,7 @@ import traceback
 # --- IMPORTS ---
 from models.ClearVision import ClearVisionGenerator, PatchGANDiscriminator
 from utils.dataset import TurbidDataset
-from utils.losses import generator_loss, PerceptualLoss, MSSSIMLoss
+from utils.losses import generator_loss, PerceptualLoss, SSIMLoss
 
 # --- CONFIG ---
 SEARCH_EPOCHS = 30     
@@ -289,7 +289,7 @@ def objective(trial):
         from torchvision.models import vgg19
         vgg = vgg19(weights='DEFAULT').features.to(device).eval()
         perceptual_fn = PerceptualLoss(vgg).to(device)
-        ssim_fn = MSSSIMLoss().to(device)
+        ssim_fn = SSIMLoss().to(device)
         
         lambdas = {
             "adv": lambda_adv, 
