@@ -411,7 +411,7 @@ def objective(trial):
         gc.collect()
 
 if __name__ == "__main__":
-    db_path = os.path.abspath("optuna_clearvision_phase1.db")
+    db_path = "/content/drive/MyDrive/optuna_clearvision_phase1.db"
     storage_url = f"sqlite:///{db_path}"
     study_name = "cv_phase1_anchored"
     
