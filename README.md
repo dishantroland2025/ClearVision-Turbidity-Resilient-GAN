@@ -27,7 +27,7 @@ It incorporates:
 - **Edge-aware reconstruction** to preserve structural details in degraded scenes.
 
 <p align="center">
-  <img src="Generator_Architecture.png" width="95%">
+  <img src="Generator_Diagram.png" width="95%">
 </p>
 
 <p align="center">
