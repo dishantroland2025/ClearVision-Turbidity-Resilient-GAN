@@ -212,5 +212,119 @@ across different underwater image enhancement models.
 
 ---
 
+---
+
+## ORB Feature Matching and Robotic Utility
+
+Beyond image enhancement, ClearVision is designed to improve downstream robotic perception in highly turbid underwater environments.
+
+To evaluate practical applicability, ORB (Oriented FAST and Rotated BRIEF) feature matching was performed between degraded underwater images and their corresponding reference images. Feature correspondences were filtered using Lowe's ratio test with a threshold of 0.75.
+
+### Results
+
+| Method | Average Valid ORB Matches |
+| :--- | :---: |
+| Raw Turbid Input | 1.75 |
+| ClearVision | **410.73** |
+
+This corresponds to a **234.7× increase** in valid feature correspondences, demonstrating that ClearVision restores structural information essential for underwater robotic perception.
+
+The increase in reliable landmarks directly benefits:
+
+- Visual SLAM
+- Visual Odometry
+- Underwater Navigation
+- Obstacle Avoidance
+- Long-Term Feature Tracking
+
+<p align="center">
+  <img src="ORB_Feature_Matching.png" width="90%">
+</p>
+
+<p align="center">
+  <em>
+Fig: ORB feature matching before and after enhancement.
+  </em>
+</p>
+
+---
+
+## Ablation Study
+
+To quantify the contribution of each proposed component, an ablation study was conducted using the same backbone architecture and training protocol.
+
+| Configuration | PSNR (↑) | SSIM (↑) | UIQM (↑) |
+| :--- | :---: | :---: | :---: |
+| Baseline GAN | 18.242 | 0.682 | 3.109 |
+| Without Depth Loss | 18.966 | 0.713 | 3.108 |
+| Without Spatial Attention | 18.805 | 0.714 | 3.091 |
+| Without MSCC | 19.184 | 0.728 | 3.092 |
+| Full ClearVision | **19.179** | **0.726** | **3.131** |
+
+### Key Findings
+
+- The depth-guided loss improves structural consistency and scene reconstruction.
+- Spatial attention significantly improves feature preservation in sediment-degraded environments.
+- The MSCC module enhances perceptual image quality and colour fidelity.
+- Combining all proposed components provides the best overall balance between restoration quality and visual realism.
+
+---
+
+## Physics-Informed Learning
+
+Unlike conventional underwater enhancement GANs, ClearVision incorporates physical priors directly into the optimization process.
+
+### Physics-Aware Components
+
+- Depth-Weighted Attenuation Modeling
+- CIELAB Color Consistency Constraints
+- Edge-Preserving Reconstruction
+- VGG Perceptual Supervision
+- Adversarial Texture Learning
+
+These constraints encourage the model to recover realistic underwater scenes while preserving structural fidelity and natural colour characteristics.
+
+---
+
+## Computational Efficiency
+
+Real-time deployment is critical for Autonomous Underwater Vehicles (AUVs) operating under strict power and compute constraints.
+
+| Metric | ClearVision |
+| :--- | :---: |
+| Parameters | 9.1 M |
+| FPS (T4 GPU) | 50 |
+| Resolution | 256 × 256 |
+
+Compared with larger underwater enhancement networks, ClearVision achieves a favorable balance between image quality and inference speed while remaining suitable for embedded deployment.
+
+---
+
+## Applications
+
+ClearVision is particularly suited for:
+
+- Autonomous Underwater Vehicles (AUVs)
+- Remotely Operated Vehicles (ROVs)
+- Underwater Inspection Systems
+- Port and Harbor Monitoring
+- Riverine and Estuarine Exploration
+- Visual SLAM in Turbid Environments
+- Marine Infrastructure Assessment
+
+---
+
+## Citation
+
+If you use ClearVision in your research, please cite:
+
+```bibtex
+@inproceedings{singh2026clearvision,
+  title={ClearVision: A Physics-Informed Lightweight GAN for Real-Time Enhancement of Turbid Underwater Imagery},
+  author={Singh, Roland and Das, Dishant and Pradhan, Ashis},
+  booktitle={OCEANS 2026},
+  year={2026}
+}
+```
 
 
