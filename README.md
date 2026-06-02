@@ -321,9 +321,10 @@ If you use ClearVision in your research, please cite:
 ```bibtex
 @inproceedings{singh2026clearvision,
   title={ClearVision: A Physics-Informed Lightweight GAN for Real-Time Enhancement of Turbid Underwater Imagery},
-  author={Singh, Roland and Das, Dishant and Pradhan, Ashis},
-  booktitle={OCEANS 2026},
-  year={2026}
+  author={Singh, Das, Pradhan},
+  booktitle={Proceedings of OCEANS 2026 Sanya},
+  year={2026},
+  note={Accepted for publication}
 }
 ```
 
